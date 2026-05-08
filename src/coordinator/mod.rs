@@ -14,8 +14,12 @@ use crate::errors::*;
 use async_trait::async_trait;
 
 pub mod noop;
+#[cfg(feature = "coordinator")]
+pub mod redis_lease;
 
 pub use noop::NoopCoordinator;
+#[cfg(feature = "coordinator")]
+pub use redis_lease::RedisLeaseCoordinator;
 
 /// Decision returned by `BuildCoordinator::coordinate`.
 pub enum CoordinationDecision {

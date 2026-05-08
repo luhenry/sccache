@@ -148,6 +148,21 @@ services:
       - test
       - redis
 
+  test-coordinator-redis:
+    <<: *test-runner
+    image: rust:latest
+    entrypoint: /sccache/tests/integration/scripts/test-coordinator-redis.sh
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    profiles:
+      - test
+      - coordinator-redis
+
   test-memcached-deprecated:
     <<: *test-runner
     image: rust:latest

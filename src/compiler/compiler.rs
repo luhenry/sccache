@@ -726,8 +726,15 @@ where
                 // until the put future completes; its Drop releases the
                 // lease back to other nodes.
                 let lease_guard = match service.coordinator.coordinate(&key).await {
-                    Ok(CoordinationDecision::Compile(g)) => Some(g),
+                    Ok(CoordinationDecision::Compile(g)) => {
+                        info!("[{}]: coordinator: leader for {}", out_pretty, key);
+                        Some(g)
+                    }
                     Ok(CoordinationDecision::Await(handle)) => {
+                        info!(
+                            "[{}]: coordinator: waiting on peer's compile of {}",
+                            out_pretty, key
+                        );
                         // Donate the wrapper's jobserver slot for the
                         // duration of the wait so make can dispatch
                         // another recipe in our place. The wrapper's
@@ -740,17 +747,33 @@ where
                         // Donation is best-effort: legacy pipe-fd
                         // jobservers and non-make builds have no fifo
                         // path and skip donation entirely.
-                        let _donation = crate::jobserver::JobserverPipe::from_env_vars(&env_vars)
-                            .and_then(|pipe| match pipe.donate() {
-                                Ok(d) => Some(d),
+                        let _donation = match crate::jobserver::JobserverPipe::from_env_vars(
+                            &env_vars,
+                        ) {
+                            Some(pipe) => match pipe.donate() {
+                                Ok(d) => {
+                                    info!(
+                                        "[{}]: jobserver: donated slot for the duration of the wait",
+                                        out_pretty
+                                    );
+                                    Some(d)
+                                }
                                 Err(e) => {
-                                    debug!(
-                                        "[{}]: jobserver donate failed (continuing without): {}",
+                                    warn!(
+                                        "[{}]: jobserver: donate failed ({}); waiting will block one make slot",
                                         out_pretty, e
                                     );
                                     None
                                 }
-                            });
+                            },
+                            None => {
+                                debug!(
+                                    "[{}]: jobserver: no fifo:PATH in MAKEFLAGS; not donating during wait",
+                                    out_pretty
+                                );
+                                None
+                            }
+                        };
                         let outcome = handle.await_result(&*storage).await;
                         // _donation drops at the end of this arm, which
                         // is before any fall-through to a real compile.
@@ -763,8 +786,8 @@ where
                         match outcome {
                             Ok(CoordinationOutcome::GotArtifact(Cache::Hit(mut entry))) => {
                                 let duration = start.elapsed();
-                                debug!(
-                                    "[{}]: Coordinated cache hit in {}",
+                                info!(
+                                    "[{}]: coordinator: got peer's artifact in {}",
                                     out_pretty,
                                     fmt_duration_as_secs(&duration)
                                 );
@@ -796,12 +819,26 @@ where
                                 }
                             }
                             Ok(CoordinationOutcome::GotArtifact(_)) => None,
-                            Ok(CoordinationOutcome::Upgrade) | Ok(CoordinationOutcome::Timeout) => {
+                            Ok(CoordinationOutcome::Upgrade) => {
+                                info!(
+                                    "[{}]: coordinator: peer's lease expired before publish; \
+                                     compiling locally",
+                                    out_pretty
+                                );
+                                None
+                            }
+                            Ok(CoordinationOutcome::Timeout) => {
+                                warn!(
+                                    "[{}]: coordinator: max_wait elapsed before peer published; \
+                                     compiling redundantly",
+                                    out_pretty
+                                );
                                 None
                             }
                             Err(e) => {
                                 warn!(
-                                    "[{}]: await_result failed: {:?}; falling through",
+                                    "[{}]: coordinator: await_result failed ({}); \
+                                     compiling locally",
                                     out_pretty, e
                                 );
                                 None
@@ -810,7 +847,8 @@ where
                     }
                     Err(e) => {
                         warn!(
-                            "[{}]: coordinate failed: {:?}; falling back to local compile",
+                            "[{}]: coordinator: coordinate failed ({}); \
+                             compiling without coordination",
                             out_pretty, e
                         );
                         None
@@ -902,8 +940,16 @@ where
                         if res.is_ok() {
                             // Order matters: the artifact must be in
                             // storage before we wake any waiters.
-                            if let Err(e) = coordinator.publish(&key).await {
-                                warn!("[{}]: coordinator publish failed: {:?}", key, e);
+                            match coordinator.publish(&key).await {
+                                Ok(()) => info!(
+                                    "coordinator: published artifact for waiters of {}",
+                                    key
+                                ),
+                                Err(e) => warn!(
+                                    "coordinator: publish of {} failed ({}); waiters will fall \
+                                     back to polling",
+                                    key, e
+                                ),
                             }
                         }
                         // Release the lease (if we held one) only after

@@ -30,7 +30,7 @@ group =
 endgroup =
 endif
 
-BACKENDS := redis redis-deprecated memcached memcached-deprecated s3 azblob webdav basedirs multilevel multilevel-chain
+BACKENDS := redis redis-deprecated memcached memcached-deprecated s3 azblob webdav basedirs multilevel multilevel-chain coordinator-redis
 TOOLS := gcc clang cmake cmake-modules cmake-modules-v4 autotools coverage zstd
 
 # Map backends to their compose profiles
@@ -38,6 +38,7 @@ PROFILES_autotools := autotools
 PROFILES_azblob := azblob
 PROFILES_basedirs := basedirs redis memcached s3 azblob webdav
 PROFILES_clang := clang
+PROFILES_coordinator-redis := coordinator-redis redis
 PROFILES_cmake := cmake
 PROFILES_cmake-modules := cmake-modules
 PROFILES_cmake-modules-v4 := cmake-modules-v4
@@ -58,6 +59,7 @@ SERVICES_autotools :=
 SERVICES_azblob := azurite azurite-setup
 SERVICES_basedirs := redis memcached minio minio-setup azurite azurite-setup webdav
 SERVICES_clang :=
+SERVICES_coordinator-redis := redis
 SERVICES_cmake :=
 SERVICES_cmake-modules :=
 SERVICES_cmake-modules-v4 :=
@@ -87,6 +89,9 @@ help:
 	@echo "  make test-s3                 Run S3/MinIO test"
 	@echo "  make test-azblob             Run Azure Blob Storage test"
 	@echo "  make test-webdav             Run WebDAV test"
+	@echo ""
+	@echo "Build Coordination Tests:"
+	@echo "  make test-coordinator-redis  Run Redis coordinator e2e test"
 	@echo ""
 	@echo "Compiler Integration Tests:"
 	@echo "  make test-gcc                Run GCC compiler test"

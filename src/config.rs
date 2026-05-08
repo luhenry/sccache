@@ -759,13 +759,63 @@ impl Default for DistConfig {
     }
 }
 
-/// Cluster-wide build coordinator configuration. Today the only
-/// implementation is the no-op default; backend-specific sections
-/// (e.g. `[coordinator.redis]`) are added here as they land.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Cluster-wide build coordinator configuration.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
-pub struct CoordinatorConfig {}
+pub struct CoordinatorConfigs {
+    pub redis: Option<RedisCoordinatorConfig>,
+}
+
+/// Redis-backed coordinator: leases via `SET NX EX`, heartbeat via
+/// `EXPIRE`, conditional release via Lua, and pubsub for fast waiter
+/// wakeup. The lease store is small and short-lived, so this can share
+/// an instance / logical database with a Redis cache backend.
+///
+/// Config shape mirrors `[cache.redis]`: `endpoint` + `db` plus
+/// optional `username` / `password` for AUTH.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisCoordinatorConfig {
+    /// Redis endpoint, e.g. `tcp://host:6379` or `redis://host:6379`.
+    pub endpoint: String,
+    /// Username for AUTH. Optional; matches `[cache.redis]`.
+    pub username: Option<String>,
+    /// Password for AUTH. Optional; matches `[cache.redis]`.
+    pub password: Option<String>,
+    /// Logical database index. Defaults to 0.
+    #[serde(default)]
+    pub db: u32,
+    /// Backstop TTL refreshed via heartbeat. If a leader crashes, the
+    /// lease expires within this window and a waiter can take over.
+    #[serde(default = "default_lease_ttl_secs")]
+    pub lease_ttl_secs: u64,
+    /// How often the leader refreshes its lease. Conventionally 1/3
+    /// of `lease_ttl_secs`.
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+    /// Hard ceiling on how long a waiter blocks before falling
+    /// through to a redundant local compile.
+    #[serde(default = "default_max_wait_secs")]
+    pub max_wait_secs: u64,
+    /// Polling fallback interval. Catches lost pubsub notifications
+    /// and detects crashed leaders before the full deadline.
+    #[serde(default = "default_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+}
+
+fn default_lease_ttl_secs() -> u64 {
+    60
+}
+fn default_heartbeat_interval_secs() -> u64 {
+    20
+}
+fn default_max_wait_secs() -> u64 {
+    600
+}
+fn default_poll_interval_secs() -> u64 {
+    2
+}
 
 // TODO: fields only pub for tests
 #[derive(Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -774,8 +824,7 @@ pub struct CoordinatorConfig {}
 pub struct FileConfig {
     pub cache: CacheConfigs,
     pub dist: DistConfig,
-    #[serde(default)]
-    pub coordinator: CoordinatorConfig,
+    pub coordinator: CoordinatorConfigs,
     pub server_startup_timeout_ms: Option<u64>,
     /// Base directories to strip from paths for cache key computation.
     pub basedirs: Vec<String>,
@@ -1222,7 +1271,7 @@ pub struct Config {
     pub cache_configs: CacheConfigs,
     pub fallback_cache: DiskCacheConfig,
     pub dist: DistConfig,
-    pub coordinator: CoordinatorConfig,
+    pub coordinator: CoordinatorConfigs,
     pub server_startup_timeout: Option<std::time::Duration>,
     /// Base directory (or directories) to strip from paths for cache key computation.
     /// Similar to ccache's CCACHE_BASEDIR.
