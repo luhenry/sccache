@@ -66,6 +66,28 @@ The Redis backend uses:
   notifications, plus a `TTL` check to detect crashed leaders before
   the `max_wait_secs` deadline.
 
+### Environment variables
+
+The same configuration can be set via environment variables, mirroring
+the convention used by `[cache.s3]` / `SCCACHE_BUCKET`:
+
+| Variable                                            | Field                      |
+|-----------------------------------------------------|----------------------------|
+| `SCCACHE_COORDINATOR_REDIS_ENDPOINT` (trigger)      | `endpoint`                 |
+| `SCCACHE_COORDINATOR_REDIS_USERNAME`                | `username`                 |
+| `SCCACHE_COORDINATOR_REDIS_PASSWORD`                | `password`                 |
+| `SCCACHE_COORDINATOR_REDIS_DB`                      | `db`                       |
+| `SCCACHE_COORDINATOR_REDIS_LEASE_TTL_SECS`          | `lease_ttl_secs`           |
+| `SCCACHE_COORDINATOR_REDIS_HEARTBEAT_INTERVAL_SECS` | `heartbeat_interval_secs`  |
+| `SCCACHE_COORDINATOR_REDIS_MAX_WAIT_SECS`           | `max_wait_secs`            |
+| `SCCACHE_COORDINATOR_REDIS_POLL_INTERVAL_SECS`      | `poll_interval_secs`       |
+
+`SCCACHE_COORDINATOR_REDIS_ENDPOINT` is the trigger: setting it alone
+enables the Redis coordinator with default tunables; the rest of the
+variables are honored only when the trigger is also set. When both
+the env vars and a file `[coordinator.redis]` section are present,
+the env vars override the file's `[coordinator.redis]` entirely.
+
 If the Redis connection fails at startup, sccache logs a warning and
 falls back to the no-op coordinator -- builds keep working, just
 without cluster-wide deduplication.

@@ -767,6 +767,17 @@ pub struct CoordinatorConfigs {
     pub redis: Option<RedisCoordinatorConfig>,
 }
 
+impl CoordinatorConfigs {
+    /// Per-field merge: if `other.redis` is `Some`, it replaces
+    /// `self.redis`. Future backends slot in next to it.
+    fn merge(&mut self, other: Self) {
+        let CoordinatorConfigs { redis } = other;
+        if redis.is_some() {
+            self.redis = redis;
+        }
+    }
+}
+
 /// Redis-backed coordinator: leases via `SET NX EX`, heartbeat via
 /// `EXPIRE`, conditional release via Lua, and pubsub for fast waiter
 /// wakeup. The lease store is small and short-lived, so this can share
@@ -865,6 +876,7 @@ pub fn try_read_config_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T
 #[derive(Debug)]
 pub struct EnvConfig {
     cache: CacheConfigs,
+    coordinator: CoordinatorConfigs,
     basedirs: Option<Vec<String>>,
 }
 
@@ -1239,7 +1251,52 @@ fn config_from_env() -> Result<EnvConfig> {
             .collect()
     });
 
-    Ok(EnvConfig { cache, basedirs })
+    // ======= Coordinator (Redis) =======
+    // Trigger: SCCACHE_COORDINATOR_REDIS_ENDPOINT. If set, build a
+    // full RedisCoordinatorConfig from env vars; the four tunables
+    // fall back to their TOML defaults when their env vars are unset.
+    let coordinator_redis = if let Ok(endpoint) = env::var("SCCACHE_COORDINATOR_REDIS_ENDPOINT") {
+        let username = env::var("SCCACHE_COORDINATOR_REDIS_USERNAME").ok();
+        let password = env::var("SCCACHE_COORDINATOR_REDIS_PASSWORD").ok();
+        let db = number_from_env_var::<u32>("SCCACHE_COORDINATOR_REDIS_DB")
+            .transpose()?
+            .unwrap_or(0);
+        let lease_ttl_secs = number_from_env_var::<u64>("SCCACHE_COORDINATOR_REDIS_LEASE_TTL_SECS")
+            .transpose()?
+            .unwrap_or_else(default_lease_ttl_secs);
+        let heartbeat_interval_secs =
+            number_from_env_var::<u64>("SCCACHE_COORDINATOR_REDIS_HEARTBEAT_INTERVAL_SECS")
+                .transpose()?
+                .unwrap_or_else(default_heartbeat_interval_secs);
+        let max_wait_secs = number_from_env_var::<u64>("SCCACHE_COORDINATOR_REDIS_MAX_WAIT_SECS")
+            .transpose()?
+            .unwrap_or_else(default_max_wait_secs);
+        let poll_interval_secs =
+            number_from_env_var::<u64>("SCCACHE_COORDINATOR_REDIS_POLL_INTERVAL_SECS")
+                .transpose()?
+                .unwrap_or_else(default_poll_interval_secs);
+        Some(RedisCoordinatorConfig {
+            endpoint,
+            username,
+            password,
+            db,
+            lease_ttl_secs,
+            heartbeat_interval_secs,
+            max_wait_secs,
+            poll_interval_secs,
+        })
+    } else {
+        None
+    };
+    let coordinator = CoordinatorConfigs {
+        redis: coordinator_redis,
+    };
+
+    Ok(EnvConfig {
+        cache,
+        coordinator,
+        basedirs,
+    })
 }
 
 // The directories crate changed the location of `config_dir` on macos in version 3,
@@ -1296,7 +1353,7 @@ impl Config {
         let FileConfig {
             cache,
             dist,
-            coordinator,
+            mut coordinator,
             server_startup_timeout_ms,
             basedirs: file_basedirs,
         } = file_conf;
@@ -1307,9 +1364,13 @@ impl Config {
 
         let EnvConfig {
             cache,
+            coordinator: env_coordinator,
             basedirs: env_basedirs,
         } = env_conf;
         conf_caches.merge(cache);
+        // Env-set coordinator backends override the file's per-field
+        // (today: only redis). Mirrors `conf_caches.merge` above.
+        coordinator.merge(env_coordinator);
 
         // Environment variable takes precedence over file config if it is set
         let basedirs_raw = if let Some(basedirs) = env_basedirs {
@@ -1606,6 +1667,132 @@ pub mod server {
 }
 
 #[test]
+#[serial]
+fn test_coordinator_redis_env_only() {
+    use temp_env::with_vars;
+    with_vars(
+        [
+            ("SCCACHE_COORDINATOR_REDIS_ENDPOINT", Some("tcp://r:6379")),
+            ("SCCACHE_COORDINATOR_REDIS_USERNAME", Some("u")),
+            ("SCCACHE_COORDINATOR_REDIS_PASSWORD", Some("p")),
+            ("SCCACHE_COORDINATOR_REDIS_DB", Some("3")),
+            ("SCCACHE_COORDINATOR_REDIS_LEASE_TTL_SECS", Some("90")),
+        ],
+        || {
+            let env_conf = config_from_env().unwrap();
+            let cfg = env_conf
+                .coordinator
+                .redis
+                .as_ref()
+                .expect("env-trigger should produce a redis coordinator config");
+            assert_eq!(cfg.endpoint, "tcp://r:6379");
+            assert_eq!(cfg.username.as_deref(), Some("u"));
+            assert_eq!(cfg.password.as_deref(), Some("p"));
+            assert_eq!(cfg.db, 3);
+            assert_eq!(cfg.lease_ttl_secs, 90);
+            // Untuned fields fall back to TOML defaults.
+            assert_eq!(cfg.heartbeat_interval_secs, 20);
+            assert_eq!(cfg.max_wait_secs, 600);
+            assert_eq!(cfg.poll_interval_secs, 2);
+        },
+    );
+}
+
+#[test]
+#[serial]
+fn test_coordinator_redis_env_unset_means_no_env_redis() {
+    use temp_env::with_vars;
+    with_vars(
+        [
+            ("SCCACHE_COORDINATOR_REDIS_ENDPOINT", None::<&str>),
+            // Tunables alone (without the trigger) must NOT enable
+            // the coordinator -- mirrors `SCCACHE_BUCKET` semantics
+            // for s3.
+            ("SCCACHE_COORDINATOR_REDIS_DB", Some("3")),
+            ("SCCACHE_COORDINATOR_REDIS_USERNAME", Some("u")),
+        ],
+        || {
+            let env_conf = config_from_env().unwrap();
+            assert!(env_conf.coordinator.redis.is_none());
+        },
+    );
+}
+
+#[test]
+#[serial]
+fn test_coordinator_redis_env_overrides_file() {
+    use temp_env::with_vars;
+    with_vars(
+        [(
+            "SCCACHE_COORDINATOR_REDIS_ENDPOINT",
+            Some("tcp://from-env:6379"),
+        )],
+        || {
+            let env_conf = config_from_env().unwrap();
+            let file_conf = FileConfig {
+                cache: Default::default(),
+                dist: Default::default(),
+                coordinator: CoordinatorConfigs {
+                    redis: Some(RedisCoordinatorConfig {
+                        endpoint: "tcp://from-file:6379".to_string(),
+                        username: None,
+                        password: None,
+                        db: 7,
+                        lease_ttl_secs: 30,
+                        heartbeat_interval_secs: 10,
+                        max_wait_secs: 100,
+                        poll_interval_secs: 1,
+                    }),
+                },
+                server_startup_timeout_ms: None,
+                basedirs: vec![],
+            };
+            let merged = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
+            let redis = merged
+                .coordinator
+                .redis
+                .expect("merged config should keep a redis coordinator");
+            assert_eq!(redis.endpoint, "tcp://from-env:6379");
+        },
+    );
+}
+
+#[test]
+#[serial]
+fn test_coordinator_redis_env_unset_keeps_file() {
+    use temp_env::with_vars;
+    with_vars(
+        [("SCCACHE_COORDINATOR_REDIS_ENDPOINT", None::<&str>)],
+        || {
+            let env_conf = config_from_env().unwrap();
+            let file_conf = FileConfig {
+                cache: Default::default(),
+                dist: Default::default(),
+                coordinator: CoordinatorConfigs {
+                    redis: Some(RedisCoordinatorConfig {
+                        endpoint: "tcp://from-file:6379".to_string(),
+                        username: None,
+                        password: None,
+                        db: 0,
+                        lease_ttl_secs: 60,
+                        heartbeat_interval_secs: 20,
+                        max_wait_secs: 600,
+                        poll_interval_secs: 2,
+                    }),
+                },
+                server_startup_timeout_ms: None,
+                basedirs: vec![],
+            };
+            let merged = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
+            assert_eq!(
+                merged.coordinator.redis.unwrap().endpoint,
+                "tcp://from-file:6379"
+            );
+        },
+    );
+}
+
+#[test]
 fn test_parse_size() {
     assert_eq!(None, parse_size(""));
     assert_eq!(None, parse_size("bogus value"));
@@ -1644,6 +1831,7 @@ fn config_overrides() {
             ..Default::default()
         },
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1736,6 +1924,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec!["C:/env/basedir".to_string()].into(),
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1753,6 +1942,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1770,6 +1960,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec![].into(),
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1787,6 +1978,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec![].into(),
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1808,6 +2000,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec!["/env/basedir".to_string()].into(),
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1825,6 +2018,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1842,6 +2036,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec![].into(),
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1859,6 +2054,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec![].into(),
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1874,6 +2070,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2569,6 +2766,7 @@ fn test_integration_config_normalizes_and_strips() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2603,6 +2801,7 @@ fn test_integration_normalized_path_with_double_slashes() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2633,6 +2832,7 @@ fn test_integration_windows_path_normalization() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2664,6 +2864,7 @@ fn test_integration_cow_borrowed_when_no_match() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2695,6 +2896,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2725,6 +2927,7 @@ fn test_integration_multiple_basedirs_longest_match() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2760,6 +2963,7 @@ fn test_integration_paths_with_dots_normalized() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2791,6 +2995,7 @@ fn test_integration_windows_mixed_slashes() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
