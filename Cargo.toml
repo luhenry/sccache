@@ -168,6 +168,7 @@ version = "0.52"
 
 [features]
 all = [
+  "coordinator",
   "dist-client",
   "redis",
   "s3",
@@ -180,6 +181,7 @@ all = [
   "cos",
 ]
 azure = ["opendal/services-azblob", "reqsign", "reqwest"]
+coordinator = []
 cos = ["opendal/services-cos", "reqsign", "reqwest"]
 default = ["all"]
 gcs = ["opendal/services-gcs", "reqsign", "url", "reqwest"]

@@ -21,6 +21,7 @@ use crate::compiler::{
 #[cfg(feature = "dist-client")]
 use crate::config;
 use crate::config::Config;
+use crate::coordinator::{BuildCoordinator, NoopCoordinator};
 use crate::dist;
 use crate::jobserver::Client;
 use crate::mock_command::{CommandCreatorSync, ProcessCommandCreator};
@@ -792,6 +793,10 @@ where
     /// Cache storage.
     storage: Arc<dyn Storage>,
 
+    /// Cluster-wide build coordinator. Defaults to a no-op that always
+    /// tells the caller to compile locally.
+    pub(crate) coordinator: Arc<dyn BuildCoordinator>,
+
     /// A cache of known compiler info.
     compilers: Arc<RwLock<CompilerMap<C>>>,
 
@@ -926,6 +931,7 @@ where
             stats: Arc::default(),
             dist_client: Arc::new(dist_client),
             storage,
+            coordinator: Arc::new(NoopCoordinator::new()),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt,
@@ -947,6 +953,7 @@ where
             stats: Arc::default(),
             dist_client: Arc::new(dist_client),
             storage,
+            coordinator: Arc::new(NoopCoordinator::new()),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt,
@@ -982,6 +989,7 @@ where
                 dist_client,
             ))),
             storage,
+            coordinator: Arc::new(NoopCoordinator::new()),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt: rt.clone(),

@@ -759,6 +759,14 @@ impl Default for DistConfig {
     }
 }
 
+/// Cluster-wide build coordinator configuration. Today the only
+/// implementation is the no-op default; backend-specific sections
+/// (e.g. `[coordinator.redis]`) are added here as they land.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinatorConfig {}
+
 // TODO: fields only pub for tests
 #[derive(Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default)]
@@ -766,6 +774,8 @@ impl Default for DistConfig {
 pub struct FileConfig {
     pub cache: CacheConfigs,
     pub dist: DistConfig,
+    #[serde(default)]
+    pub coordinator: CoordinatorConfig,
     pub server_startup_timeout_ms: Option<u64>,
     /// Base directories to strip from paths for cache key computation.
     pub basedirs: Vec<String>,
@@ -1212,6 +1222,7 @@ pub struct Config {
     pub cache_configs: CacheConfigs,
     pub fallback_cache: DiskCacheConfig,
     pub dist: DistConfig,
+    pub coordinator: CoordinatorConfig,
     pub server_startup_timeout: Option<std::time::Duration>,
     /// Base directory (or directories) to strip from paths for cache key computation.
     /// Similar to ccache's CCACHE_BASEDIR.
@@ -1236,6 +1247,7 @@ impl Config {
         let FileConfig {
             cache,
             dist,
+            coordinator,
             server_startup_timeout_ms,
             basedirs: file_basedirs,
         } = file_conf;
@@ -1306,6 +1318,7 @@ impl Config {
             cache_configs: conf_caches,
             fallback_cache,
             dist,
+            coordinator,
             server_startup_timeout,
             basedirs,
         })
@@ -1609,6 +1622,7 @@ fn config_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        coordinator: Default::default(),
     };
 
     assert_eq!(
@@ -1661,6 +1675,7 @@ fn config_overrides() {
             dist: Default::default(),
             server_startup_timeout: None,
             basedirs: vec![],
+            coordinator: Default::default(),
         }
     );
 }
@@ -1679,6 +1694,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1695,6 +1711,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1711,6 +1728,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1727,6 +1745,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1747,6 +1766,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1763,6 +1783,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1779,6 +1800,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1795,6 +1817,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1809,6 +1832,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1967,6 +1991,7 @@ fn test_env_basedirs_with_spaces() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        coordinator: Default::default(),
     };
     Config::from_env_and_file_configs(env_conf, file_conf)
         .expect_err("Should fail due to non-absolute path");
@@ -2001,6 +2026,7 @@ fn test_env_basedirs_with_spaces() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        coordinator: Default::default(),
     };
     Config::from_env_and_file_configs(env_conf, file_conf)
         .expect_err("Should fail due to non-absolute path");
@@ -2383,6 +2409,7 @@ key_prefix = "cosprefix"
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
+            coordinator: Default::default(),
         }
     );
 }
@@ -2476,6 +2503,7 @@ size = "7g"
             },
             server_startup_timeout_ms: None,
             basedirs: vec![],
+            coordinator: Default::default(),
         }
     );
 }
@@ -2499,6 +2527,7 @@ fn test_integration_config_normalizes_and_strips() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/project".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2532,6 +2561,7 @@ fn test_integration_normalized_path_with_double_slashes() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home//user///project/".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2561,6 +2591,7 @@ fn test_integration_windows_path_normalization() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:\\Users\\Test\\Project".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2591,6 +2622,7 @@ fn test_integration_cow_borrowed_when_no_match() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/project".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2621,6 +2653,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2650,6 +2683,7 @@ fn test_integration_multiple_basedirs_longest_match() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user".to_string(), "/home/user/project".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2684,6 +2718,7 @@ fn test_integration_paths_with_dots_normalized() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/./project/../project".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2714,6 +2749,7 @@ fn test_integration_windows_mixed_slashes() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:\\Users\\test\\project".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();

@@ -29,6 +29,7 @@ use crate::compiler::nvhpc::Nvhpc;
 use crate::compiler::ptxas::Ptxas;
 use crate::compiler::rust::{Rust, RustupProxy};
 use crate::compiler::tasking_vx::TaskingVX;
+use crate::coordinator::{CoordinationDecision, CoordinationOutcome};
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
@@ -719,6 +720,103 @@ where
                         .await;
                 }
 
+                // Cluster-wide deduplication: ask the coordinator whether
+                // this node should compile or wait for a peer that already
+                // started. The lease guard (when we're the leader) lives
+                // until the put future completes; its Drop releases the
+                // lease back to other nodes.
+                let lease_guard = match service.coordinator.coordinate(&key).await {
+                    Ok(CoordinationDecision::Compile(g)) => Some(g),
+                    Ok(CoordinationDecision::Await(handle)) => {
+                        // Donate the wrapper's jobserver slot for the
+                        // duration of the wait so make can dispatch
+                        // another recipe in our place. The wrapper's
+                        // `MAKEFLAGS` (carried in `env_vars`) names the
+                        // pipe. The donation guard's `Drop` reads one
+                        // byte back to reacquire -- so we bind it to a
+                        // named local that lives across the await and
+                        // is dropped right before we proceed.
+                        //
+                        // Donation is best-effort: legacy pipe-fd
+                        // jobservers and non-make builds have no fifo
+                        // path and skip donation entirely.
+                        let _donation = crate::jobserver::JobserverPipe::from_env_vars(&env_vars)
+                            .and_then(|pipe| match pipe.donate() {
+                                Ok(d) => Some(d),
+                                Err(e) => {
+                                    debug!(
+                                        "[{}]: jobserver donate failed (continuing without): {}",
+                                        out_pretty, e
+                                    );
+                                    None
+                                }
+                            });
+                        let outcome = handle.await_result(&*storage).await;
+                        // _donation drops at the end of this arm, which
+                        // is before any fall-through to a real compile.
+                        // Decompression in the GotArtifact branch can
+                        // run while still donated -- the local cache
+                        // hit path doesn't need the token, and the
+                        // function-return below drops _donation as
+                        // part of stack unwinding so the byte
+                        // accounting still balances.
+                        match outcome {
+                            Ok(CoordinationOutcome::GotArtifact(Cache::Hit(mut entry))) => {
+                                let duration = start.elapsed();
+                                debug!(
+                                    "[{}]: Coordinated cache hit in {}",
+                                    out_pretty,
+                                    fmt_duration_as_secs(&duration)
+                                );
+                                let output = process::Output {
+                                    status: exit_status(0),
+                                    stdout: entry.get_stdout(),
+                                    stderr: entry.get_stderr(),
+                                };
+                                let filtered_outputs = if compilation.is_locally_preprocessed() {
+                                    outputs.iter().filter(|f| f.key != "d").cloned().collect()
+                                } else {
+                                    outputs.clone()
+                                };
+                                match entry.extract_objects(filtered_outputs, &pool).await {
+                                    Ok(()) => {
+                                        return Ok((CompileResult::CacheHit(duration), output));
+                                    }
+                                    Err(e) => {
+                                        if e.downcast_ref::<DecompressionFailure>().is_some() {
+                                            debug!(
+                                                "[{}]: failed to decompress coordinated artifact",
+                                                out_pretty
+                                            );
+                                            None
+                                        } else {
+                                            return Err(e);
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(CoordinationOutcome::GotArtifact(_)) => None,
+                            Ok(CoordinationOutcome::Upgrade) | Ok(CoordinationOutcome::Timeout) => {
+                                None
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "[{}]: await_result failed: {:?}; falling through",
+                                    out_pretty, e
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[{}]: coordinate failed: {:?}; falling back to local compile",
+                            out_pretty, e
+                        );
+                        None
+                    }
+                };
+
                 let (cacheable, dist_type, compiler_result) = dist_or_local_compile(
                     service,
                     dist_client,
@@ -784,11 +882,13 @@ where
                 );
 
                 let out_pretty2 = out_pretty.clone();
+                let coordinator = service.coordinator.clone();
+                let lease = lease_guard;
                 // Try to finish storing the newly-written cache
                 // entry. We'll get the result back elsewhere.
                 let future = async move {
                     let start = Instant::now();
-                    match storage.put(&key, entry).await {
+                    let res = match storage.put(&key, entry).await {
                         Ok(_) => {
                             debug!("[{}]: Stored in cache successfully!", out_pretty2);
                             Ok(CacheWriteInfo {
@@ -797,7 +897,22 @@ where
                             })
                         }
                         Err(e) => Err(e),
+                    };
+                    {
+                        if res.is_ok() {
+                            // Order matters: the artifact must be in
+                            // storage before we wake any waiters.
+                            if let Err(e) = coordinator.publish(&key).await {
+                                warn!("[{}]: coordinator publish failed: {:?}", key, e);
+                            }
+                        }
+                        // Release the lease (if we held one) only after
+                        // publish, so a peer doesn't acquire it and
+                        // start a redundant compile in the gap between
+                        // our put and our publish.
+                        drop(lease);
                     }
+                    res
                 };
                 let future = Box::pin(future);
                 Ok((
