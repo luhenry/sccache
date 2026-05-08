@@ -83,6 +83,11 @@ object = "0.37"
 opendal = { version = "0.55.0", optional = true, default-features = false }
 openssl = { version = "0.10.75", optional = true }
 rand = "0.8.4"
+redis = { version = "1.2", optional = true, default-features = false, features = [
+  "tokio-comp",
+  "connection-manager",
+  "script",
+] }
 regex = "1.10.3"
 reqsign = { version = "0.18.0", optional = true }
 reqwest = { version = "0.12", features = [
@@ -181,7 +186,7 @@ all = [
   "cos",
 ]
 azure = ["opendal/services-azblob", "reqsign", "reqwest"]
-coordinator = []
+coordinator = ["dep:redis"]
 cos = ["opendal/services-cos", "reqsign", "reqwest"]
 default = ["all"]
 gcs = ["opendal/services-gcs", "reqsign", "url", "reqwest"]

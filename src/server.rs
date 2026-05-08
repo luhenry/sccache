@@ -424,6 +424,34 @@ thread_local! {
     static PANIC_LOCATION: Cell<Option<(String, u32, u32)>> = const { Cell::new(None) };
 }
 
+/// Build the cluster-wide build coordinator from config. Falls back to
+/// the no-op coordinator when no backend is configured, when a
+/// configured backend fails to initialize, or when the configured
+/// backend is gated out by the active Cargo features.
+fn build_coordinator(
+    config: &Config,
+    #[cfg_attr(not(feature = "coordinator"), allow(unused_variables))] runtime: &Runtime,
+) -> Arc<dyn BuildCoordinator> {
+    #[cfg(feature = "coordinator")]
+    if let Some(redis_cfg) = &config.coordinator.redis {
+        match runtime.block_on(crate::coordinator::RedisLeaseCoordinator::new(redis_cfg)) {
+            Ok(c) => {
+                info!("coordinator: redis at {}", redis_cfg.endpoint);
+                return Arc::new(c);
+            }
+            Err(e) => warn!("coordinator: redis init failed ({e}); falling back to noop"),
+        }
+    }
+    #[cfg(not(feature = "coordinator"))]
+    if config.coordinator.redis.is_some() {
+        warn!(
+            "coordinator: [coordinator.redis] is configured but the `coordinator` \
+             Cargo feature is disabled; ignoring"
+        );
+    }
+    Arc::new(NoopCoordinator::new())
+}
+
 /// Start an sccache server, listening on `addr`.
 ///
 /// Spins an event loop handling client connections until a client
@@ -490,13 +518,21 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
         _ => raw_storage,
     };
 
+    let coordinator = build_coordinator(config, &runtime);
+
     let res: io::Result<(crate::net::SocketAddr, Box<dyn FnOnce(_) -> io::Result<()>>)> = (|| {
         match addr {
             crate::net::SocketAddr::Net(addr) => {
                 trace!("binding TCP {addr}");
                 let l = runtime.block_on(tokio::net::TcpListener::bind(addr))?;
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                let srv = SccacheServer::<_>::with_listener(
+                    l,
+                    runtime,
+                    client,
+                    dist_client,
+                    storage,
+                    coordinator,
+                );
                 Ok((
                     srv.local_addr().unwrap(),
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
@@ -511,8 +547,14 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     let _guard = runtime.enter();
                     tokio::net::UnixListener::bind(path)?
                 };
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                let srv = SccacheServer::<_>::with_listener(
+                    l,
+                    runtime,
+                    client,
+                    dist_client,
+                    storage,
+                    coordinator,
+                );
                 Ok((
                     srv.local_addr().unwrap(),
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
@@ -528,8 +570,14 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     let _guard = runtime.enter();
                     tokio::net::UnixListener::from_std(l)?
                 };
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                let srv = SccacheServer::<_>::with_listener(
+                    l,
+                    runtime,
+                    client,
+                    dist_client,
+                    storage,
+                    coordinator,
+                );
                 Ok((
                     srv.local_addr()
                         .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(p.clone())),
@@ -585,6 +633,7 @@ impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
         client: Client,
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
+        coordinator: Arc<dyn BuildCoordinator>,
     ) -> Result<Self> {
         let addr = crate::net::SocketAddr::with_port(port);
         let listener = runtime.block_on(tokio::net::TcpListener::bind(addr.as_net().unwrap()))?;
@@ -595,6 +644,7 @@ impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
             client,
             dist_client,
             storage,
+            coordinator,
         ))
     }
 }
@@ -606,13 +656,15 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         client: Client,
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
+        coordinator: Arc<dyn BuildCoordinator>,
     ) -> Self {
         // Prepare the service which we'll use to service all incoming TCP
         // connections.
         let (tx, rx) = mpsc::channel(1);
         let (wait, info) = WaitUntilZero::new();
         let pool = runtime.handle().clone();
-        let service = SccacheService::new(dist_client, storage, &client, pool, tx, info);
+        let service =
+            SccacheService::new(dist_client, storage, coordinator, &client, pool, tx, info);
 
         SccacheServer {
             runtime,
@@ -922,6 +974,7 @@ where
     pub fn new(
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
+        coordinator: Arc<dyn BuildCoordinator>,
         client: &Client,
         rt: tokio::runtime::Handle,
         tx: mpsc::Sender<ServerMessage>,
@@ -931,7 +984,7 @@ where
             stats: Arc::default(),
             dist_client: Arc::new(dist_client),
             storage,
-            coordinator: Arc::new(NoopCoordinator::new()),
+            coordinator,
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt,

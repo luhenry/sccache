@@ -30,6 +30,48 @@ runtime effect. A backend-specific section under `[coordinator]` in the
 sccache config selects an actual coordinator implementation; backends are
 documented separately as they land.
 
+## Redis backend
+
+The first available backend is Redis. Add a `[coordinator.redis]`
+section to the sccache config:
+
+```toml
+[coordinator.redis]
+endpoint = "tcp://redis.example.internal:6379"
+db = 0                       # logical database (default 0)
+lease_ttl_secs = 60          # backstop for crashed leaders
+heartbeat_interval_secs = 20 # leader refreshes the lease
+max_wait_secs = 600          # waiter ceiling -> redundant compile
+poll_interval_secs = 2       # pubsub fallback / TTL re-check
+```
+
+The shape of the section matches `[cache.redis]` so the same
+`endpoint` + `db` form works in both places. Only `endpoint` is
+required; the other fields default to the values shown. The lease
+store is small and ephemeral, so it can share the Redis instance
+(and logical database) used by the Redis cache backend.
+
+The Redis backend uses:
+
+* `SET NX EX` for atomic lease acquisition with TTL.
+* `EXPIRE` from a per-leader heartbeat task to keep the lease alive
+  for the duration of a long compile.
+* A Lua `GET / DEL` script for self-fenced lease release that cannot
+  stomp a successor's lease if a slow Drop races past the TTL.
+* `PUBLISH` on a per-key channel for sub-second waiter wakeup.
+* Polling on `poll_interval_secs` as a fallback for lost pubsub
+  notifications, plus a `TTL` check to detect crashed leaders before
+  the `max_wait_secs` deadline.
+
+If the Redis connection fails at startup, sccache logs a warning and
+falls back to the no-op coordinator -- builds keep working, just
+without cluster-wide deduplication.
+
+The Redis backend has an end-to-end integration test against a real
+Redis container (`tests/integration/scripts/test-coordinator-redis.sh`,
+exercised by `make test-coordinator-redis` and as part of
+`make test-backends`).
+
 ## Mental model
 
 The coordinator's lease is an optimization hint, not a correctness
