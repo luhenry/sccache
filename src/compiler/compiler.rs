@@ -722,7 +722,9 @@ where
                 // Cluster-wide deduplication: ask the coordinator whether
                 // this node should compile or wait for a peer.
                 let lease_guard =
-                    match coordinate_for_compile(service, &*storage, &key, &out_pretty).await {
+                    match coordinate_for_compile(service, &*storage, &key, &out_pretty, &env_vars)
+                        .await
+                    {
                         Coordinated::Lead(g) => g,
                         Coordinated::AwaitedHit {
                             mut entry,
@@ -1293,6 +1295,7 @@ async fn coordinate_for_compile<C>(
     storage: &dyn Storage,
     key: &str,
     out_pretty: &str,
+    env_vars: &[(OsString, OsString)],
 ) -> Coordinated
 where
     C: CommandCreatorSync + Clone + Send + Sync + 'static,
@@ -1315,6 +1318,23 @@ where
                 "[{}]: coordinator: waiting on peer's compile of {}",
                 out_pretty, key
             );
+            // Free the wrapper's jobserver slot so make can dispatch
+            // another recipe while we wait. The guard's `Drop` reads one
+            // byte back at end-of-scope to reacquire; the blocking read
+            // provides back-pressure.
+            let _donation = match crate::jobserver::JobserverPipe::from_env_vars(env_vars) {
+                Some(pipe) => match pipe.donate() {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        warn!(
+                            "[{}]: jobserver: donate failed ({}); waiting will block one make slot",
+                            out_pretty, e
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
             let await_start = Instant::now();
             let outcome = handle.await_result(storage).await;
             let await_duration = await_start.elapsed();
@@ -3910,7 +3930,7 @@ mod coordinator_tests {
     #[test]
     fn noop_returns_lead_without_lease_acquired_bump() {
         let (rt, svc, storage) = build_svc(Arc::new(NoopCoordinator::new()));
-        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o"));
+        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o", &[]));
         assert!(matches!(result, Coordinated::Lead(Some(_))));
         let s = rt.block_on(snapshot(&svc));
         // Noop is excluded from the leader counter on purpose; with the
@@ -3924,7 +3944,7 @@ mod coordinator_tests {
         let mock = Arc::new(MockCoordinator::new("mock"));
         mock.enqueue(MockDecision::Compile);
         let (rt, svc, storage) = build_svc(mock);
-        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o"));
+        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o", &[]));
         assert!(matches!(result, Coordinated::Lead(Some(_))));
         let s = rt.block_on(snapshot(&svc));
         assert_eq!(s.coordinator_lease_acquired, 1);
@@ -3943,7 +3963,7 @@ mod coordinator_tests {
         storage.next_get(Ok(Cache::Hit(
             CacheRead::from(Cursor::new(entry_bytes)).unwrap(),
         )));
-        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o"));
+        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o", &[]));
         match result {
             Coordinated::AwaitedHit {
                 entry: _,
@@ -3973,7 +3993,7 @@ mod coordinator_tests {
         let (rt, svc, storage) = build_svc(mock);
         // Storage returns a Miss -> GotArtifact(Miss) -> wasted in helper.
         storage.next_get(Ok(Cache::Miss));
-        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o"));
+        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o", &[]));
         assert!(matches!(result, Coordinated::FallThrough));
         let s = rt.block_on(snapshot(&svc));
         assert_eq!(s.coordinator_await_started, 1);
@@ -3990,7 +4010,7 @@ mod coordinator_tests {
         let mock = Arc::new(MockCoordinator::new("mock"));
         mock.enqueue(MockDecision::Await(MockOutcome::Upgrade));
         let (rt, svc, storage) = build_svc(mock);
-        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o"));
+        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o", &[]));
         assert!(matches!(result, Coordinated::FallThrough));
         let s = rt.block_on(snapshot(&svc));
         assert_eq!(s.coordinator_await_started, 1);
@@ -4005,7 +4025,7 @@ mod coordinator_tests {
         let mock = Arc::new(MockCoordinator::new("mock"));
         mock.enqueue(MockDecision::Await(MockOutcome::Timeout));
         let (rt, svc, storage) = build_svc(mock);
-        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o"));
+        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o", &[]));
         assert!(matches!(result, Coordinated::FallThrough));
         let s = rt.block_on(snapshot(&svc));
         assert_eq!(s.coordinator_await_started, 1);
@@ -4020,7 +4040,7 @@ mod coordinator_tests {
         let mock = Arc::new(MockCoordinator::new("mock"));
         mock.enqueue(MockDecision::Await(MockOutcome::Error));
         let (rt, svc, storage) = build_svc(mock);
-        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o"));
+        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o", &[]));
         assert!(matches!(result, Coordinated::FallThrough));
         let s = rt.block_on(snapshot(&svc));
         assert_eq!(s.coordinator_await_started, 1);
@@ -4035,7 +4055,7 @@ mod coordinator_tests {
         let mock = Arc::new(MockCoordinator::new("mock"));
         mock.enqueue(MockDecision::CoordinateError);
         let (rt, svc, storage) = build_svc(mock);
-        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o"));
+        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o", &[]));
         assert!(matches!(result, Coordinated::FallThrough));
         let s = rt.block_on(snapshot(&svc));
         assert_eq!(s.coordinator_coordinate_errors, 1);

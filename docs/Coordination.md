@@ -32,6 +32,28 @@ returns `Compile`, every `publish` is a no-op. With the no-op backend
 sccache behaves exactly as it did before the coordinator existed; the
 machinery in the request path is dormant.
 
+## Jobserver donation
+
+If a follower simply blocks on a peer's compile, it holds the
+make/cargo jobserver slot the wrapper inherited -- and that slot is
+exactly what gates make from dispatching another recipe. With slow
+peer compiles and `make -jN`, parallelism collapses to one in-flight
+recipe per machine.
+
+To avoid this, the follower donates its slot back for the duration of
+the wait. The Compile RPC carries the wrapper's environment, which
+includes `MAKEFLAGS`; we extract the jobserver fifo path from
+`--jobserver-auth=fifo:PATH` and write one byte to donate. When the
+wait ends the donation guard's `Drop` reads one byte back, restoring
+the at-rest token count exactly. The blocking read is the
+back-pressure that bounds total concurrent donations.
+
+Donation is best-effort: only the `fifo:PATH` form is supported (make
+>= 4.4 / `--jobserver-style=fifo`). The legacy pipe-fd form (`R,W`)
+only works for processes that inherited those file descriptors, which
+sccache deliberately discards at daemonize time -- a follower with the
+pipe-fd form simply blocks the slot and proceeds.
+
 ## Mental model
 
 The coordinator's lease is an optimization hint, not a correctness
