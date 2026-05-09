@@ -91,6 +91,15 @@ pub trait AwaitHandleImpl: Send + Sync {
 /// sccache behavior.
 #[async_trait]
 pub trait BuildCoordinator: Send + Sync {
+    /// Short backend identifier ("noop", "redis", ...). Surfaced via
+    /// `--show-stats` and the `info!` line at server startup so the
+    /// operator can see which backend is actually in use without a
+    /// downcast. Default returns "unknown" only as a fallback for impls
+    /// that forget to override it.
+    fn name(&self) -> &'static str {
+        "unknown"
+    }
+
     /// Decide whether this node should compile `hash_key` itself or wait for
     /// another node that already started.
     async fn coordinate(&self, hash_key: &str) -> Result<CoordinationDecision>;

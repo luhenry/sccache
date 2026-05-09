@@ -22,6 +22,10 @@ impl LeaseGuardImpl for NoopGuard {}
 
 #[async_trait]
 impl BuildCoordinator for NoopCoordinator {
+    fn name(&self) -> &'static str {
+        "noop"
+    }
+
     async fn coordinate(&self, _hash_key: &str) -> Result<CoordinationDecision> {
         Ok(CoordinationDecision::Compile(LeaseGuard::new(NoopGuard)))
     }

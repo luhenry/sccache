@@ -126,6 +126,10 @@ impl RedisLeaseCoordinator {
 
 #[async_trait]
 impl BuildCoordinator for RedisLeaseCoordinator {
+    fn name(&self) -> &'static str {
+        "redis"
+    }
+
     async fn coordinate(&self, hash_key: &str) -> Result<CoordinationDecision> {
         let lease = lease_key(hash_key);
         let chan = done_channel(hash_key);

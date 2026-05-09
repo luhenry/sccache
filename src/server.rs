@@ -837,7 +837,7 @@ where
     C: Send,
 {
     /// Server statistics.
-    stats: Arc<Mutex<ServerStats>>,
+    pub(crate) stats: Arc<Mutex<ServerStats>>,
 
     /// Distributed sccache client
     dist_client: Arc<DistClientContainer>,
@@ -1690,6 +1690,43 @@ pub struct ServerStats {
     pub dist_errors: u64,
     /// Multi-level cache statistics (if multi-level caching is enabled)
     pub multi_level: Option<crate::cache::multilevel::MultiLevelStats>,
+    /// Times we acquired a coordinator lease (we became the leader for a
+    /// cache-miss compile that no peer was already holding). The noop
+    /// coordinator's "lease" is uncounted -- the noop path always returns
+    /// `Compile` and would equal `compilations`, which is meaningless.
+    #[serde(default)]
+    pub coordinator_lease_acquired: u64,
+    /// Times we entered the await path (a peer was already compiling this
+    /// hash when we hit a cache miss).
+    #[serde(default)]
+    pub coordinator_await_started: u64,
+    /// Of those awaits, the count that actually paid off: the peer's
+    /// artifact landed in storage, we fetched it, and decompression
+    /// succeeded. This is the real coordination win.
+    #[serde(default)]
+    pub coordinator_await_got_artifact: u64,
+    /// Awaits that fell through because the peer's lease expired before
+    /// the peer published (`CoordinationOutcome::Upgrade`).
+    #[serde(default)]
+    pub coordinator_await_upgraded: u64,
+    /// Awaits that fell through because `max_wait` elapsed
+    /// (`CoordinationOutcome::Timeout`).
+    #[serde(default)]
+    pub coordinator_await_timeout: u64,
+    /// Awaits that fell through because `await_result` returned an error.
+    #[serde(default)]
+    pub coordinator_await_errors: u64,
+    /// Calls to `coordinate()` that returned an error. The caller falls
+    /// through to a local compile in this case.
+    #[serde(default)]
+    pub coordinator_coordinate_errors: u64,
+    /// Successful publishes the leader sent (one per cache-miss compile
+    /// whose artifact was successfully written to storage).
+    #[serde(default)]
+    pub coordinator_publish_sent: u64,
+    /// Publish calls that failed.
+    #[serde(default)]
+    pub coordinator_publish_errors: u64,
 }
 
 /// Info and stats about the server.
@@ -1740,6 +1777,15 @@ impl Default for ServerStats {
             dist_compiles: HashMap::new(),
             dist_errors: u64::default(),
             multi_level: None,
+            coordinator_lease_acquired: u64::default(),
+            coordinator_await_started: u64::default(),
+            coordinator_await_got_artifact: u64::default(),
+            coordinator_await_upgraded: u64::default(),
+            coordinator_await_timeout: u64::default(),
+            coordinator_await_errors: u64::default(),
+            coordinator_coordinate_errors: u64::default(),
+            coordinator_publish_sent: u64::default(),
+            coordinator_publish_errors: u64::default(),
         }
     }
 }
@@ -1874,6 +1920,57 @@ impl ServerStats {
             stats_vec,
             self.dist_errors,
             "Failed distributed compilations"
+        );
+
+        // Coordinator stats. Stay zero with the noop coordinator, which is
+        // useful in itself: a real backend that never engages here will be
+        // visible as a row of zeros, while a healthy redis backend will
+        // show non-zero `lease acquired` and (for n>1 nodes) non-zero
+        // `await: got artifact`.
+        set_stat!(
+            stats_vec,
+            self.coordinator_lease_acquired,
+            "Coordinator leases acquired"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_await_started,
+            "Coordinator awaits started"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_await_got_artifact,
+            "Coordinator awaits cache hit"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_await_upgraded,
+            "Coordinator awaits stale lease"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_await_timeout,
+            "Coordinator awaits timed out"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_await_errors,
+            "Coordinator awaits errors"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_coordinate_errors,
+            "Coordinator coordinate errors"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_publish_sent,
+            "Coordinator publishes sent"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_publish_errors,
+            "Coordinator publishes failed"
         );
 
         // Add multi-level cache statistics if available

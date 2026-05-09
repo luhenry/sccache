@@ -728,9 +728,13 @@ where
                 let lease_guard = match service.coordinator.coordinate(&key).await {
                     Ok(CoordinationDecision::Compile(g)) => {
                         info!("[{}]: coordinator: leader for {}", out_pretty, key);
+                        if service.coordinator.name() != "noop" {
+                            service.stats.lock().await.coordinator_lease_acquired += 1;
+                        }
                         Some(g)
                     }
                     Ok(CoordinationDecision::Await(handle)) => {
+                        service.stats.lock().await.coordinator_await_started += 1;
                         info!(
                             "[{}]: coordinator: waiting on peer's compile of {}",
                             out_pretty, key
@@ -803,6 +807,11 @@ where
                                 };
                                 match entry.extract_objects(filtered_outputs, &pool).await {
                                     Ok(()) => {
+                                        service
+                                            .stats
+                                            .lock()
+                                            .await
+                                            .coordinator_await_got_artifact += 1;
                                         return Ok((CompileResult::CacheHit(duration), output));
                                     }
                                     Err(e) => {
@@ -825,6 +834,7 @@ where
                                      compiling locally",
                                     out_pretty
                                 );
+                                service.stats.lock().await.coordinator_await_upgraded += 1;
                                 None
                             }
                             Ok(CoordinationOutcome::Timeout) => {
@@ -833,6 +843,7 @@ where
                                      compiling redundantly",
                                     out_pretty
                                 );
+                                service.stats.lock().await.coordinator_await_timeout += 1;
                                 None
                             }
                             Err(e) => {
@@ -841,6 +852,7 @@ where
                                      compiling locally",
                                     out_pretty, e
                                 );
+                                service.stats.lock().await.coordinator_await_errors += 1;
                                 None
                             }
                         }
@@ -851,6 +863,7 @@ where
                              compiling without coordination",
                             out_pretty, e
                         );
+                        service.stats.lock().await.coordinator_coordinate_errors += 1;
                         None
                     }
                 };
@@ -921,6 +934,7 @@ where
 
                 let out_pretty2 = out_pretty.clone();
                 let coordinator = service.coordinator.clone();
+                let stats = service.stats.clone();
                 let lease = lease_guard;
                 // Try to finish storing the newly-written cache
                 // entry. We'll get the result back elsewhere.
@@ -941,15 +955,21 @@ where
                             // Order matters: the artifact must be in
                             // storage before we wake any waiters.
                             match coordinator.publish(&key).await {
-                                Ok(()) => info!(
-                                    "coordinator: published artifact for waiters of {}",
-                                    key
-                                ),
-                                Err(e) => warn!(
-                                    "coordinator: publish of {} failed ({}); waiters will fall \
-                                     back to polling",
-                                    key, e
-                                ),
+                                Ok(()) => {
+                                    stats.lock().await.coordinator_publish_sent += 1;
+                                    info!(
+                                        "coordinator: published artifact for waiters of {}",
+                                        key
+                                    );
+                                }
+                                Err(e) => {
+                                    stats.lock().await.coordinator_publish_errors += 1;
+                                    warn!(
+                                        "coordinator: publish of {} failed ({}); waiters will fall \
+                                         back to polling",
+                                        key, e
+                                    );
+                                }
                             }
                         }
                         // Release the lease (if we held one) only after
