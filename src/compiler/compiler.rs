@@ -778,7 +778,9 @@ where
                                 None
                             }
                         };
+                        let await_start = Instant::now();
                         let outcome = handle.await_result(&*storage).await;
+                        let await_duration = await_start.elapsed();
                         // _donation drops at the end of this arm, which
                         // is before any fall-through to a real compile.
                         // Decompression in the GotArtifact branch can
@@ -807,11 +809,11 @@ where
                                 };
                                 match entry.extract_objects(filtered_outputs, &pool).await {
                                     Ok(()) => {
-                                        service
-                                            .stats
-                                            .lock()
-                                            .await
-                                            .coordinator_await_got_artifact += 1;
+                                        let mut stats = service.stats.lock().await;
+                                        stats.coordinator_await_got_artifact += 1;
+                                        stats.coordinator_await_got_artifact_duration +=
+                                            await_duration;
+                                        drop(stats);
                                         return Ok((CompileResult::CacheHit(duration), output));
                                     }
                                     Err(e) => {
@@ -820,6 +822,11 @@ where
                                                 "[{}]: failed to decompress coordinated artifact",
                                                 out_pretty
                                             );
+                                            let mut stats = service.stats.lock().await;
+                                            stats.coordinator_await_wasted += 1;
+                                            stats.coordinator_await_wasted_duration +=
+                                                await_duration;
+                                            drop(stats);
                                             None
                                         } else {
                                             return Err(e);
@@ -827,14 +834,24 @@ where
                                     }
                                 }
                             }
-                            Ok(CoordinationOutcome::GotArtifact(_)) => None,
+                            Ok(CoordinationOutcome::GotArtifact(_)) => {
+                                let mut stats = service.stats.lock().await;
+                                stats.coordinator_await_wasted += 1;
+                                stats.coordinator_await_wasted_duration += await_duration;
+                                drop(stats);
+                                None
+                            }
                             Ok(CoordinationOutcome::Upgrade) => {
                                 info!(
                                     "[{}]: coordinator: peer's lease expired before publish; \
                                      compiling locally",
                                     out_pretty
                                 );
-                                service.stats.lock().await.coordinator_await_upgraded += 1;
+                                let mut stats = service.stats.lock().await;
+                                stats.coordinator_await_upgraded += 1;
+                                stats.coordinator_await_wasted += 1;
+                                stats.coordinator_await_wasted_duration += await_duration;
+                                drop(stats);
                                 None
                             }
                             Ok(CoordinationOutcome::Timeout) => {
@@ -843,7 +860,11 @@ where
                                      compiling redundantly",
                                     out_pretty
                                 );
-                                service.stats.lock().await.coordinator_await_timeout += 1;
+                                let mut stats = service.stats.lock().await;
+                                stats.coordinator_await_timeout += 1;
+                                stats.coordinator_await_wasted += 1;
+                                stats.coordinator_await_wasted_duration += await_duration;
+                                drop(stats);
                                 None
                             }
                             Err(e) => {
@@ -852,7 +873,11 @@ where
                                      compiling locally",
                                     out_pretty, e
                                 );
-                                service.stats.lock().await.coordinator_await_errors += 1;
+                                let mut stats = service.stats.lock().await;
+                                stats.coordinator_await_errors += 1;
+                                stats.coordinator_await_wasted += 1;
+                                stats.coordinator_await_wasted_duration += await_duration;
+                                drop(stats);
                                 None
                             }
                         }

@@ -1727,6 +1727,23 @@ pub struct ServerStats {
     /// Publish calls that failed.
     #[serde(default)]
     pub coordinator_publish_errors: u64,
+    /// Total wall-clock time spent waiting on peers in the awaits that
+    /// actually paid off (peer's artifact landed and we used it). Divide
+    /// by `coordinator_await_got_artifact` to get the average.
+    #[serde(default)]
+    pub coordinator_await_got_artifact_duration: Duration,
+    /// Number of awaits that did NOT pay off: we waited and then fell
+    /// through to a local compile (peer's lease expired, max_wait elapsed,
+    /// `await_result` errored, decompression failed, or a non-Hit
+    /// `GotArtifact`). The sum of `coordinator_await_upgraded`,
+    /// `coordinator_await_timeout`, `coordinator_await_errors`, plus the
+    /// non-counter fall-through arms.
+    #[serde(default)]
+    pub coordinator_await_wasted: u64,
+    /// Total wall-clock time spent on the wasted awaits above. Divide by
+    /// `coordinator_await_wasted` to get the average wasted wait.
+    #[serde(default)]
+    pub coordinator_await_wasted_duration: Duration,
 }
 
 /// Info and stats about the server.
@@ -1786,6 +1803,9 @@ impl Default for ServerStats {
             coordinator_coordinate_errors: u64::default(),
             coordinator_publish_sent: u64::default(),
             coordinator_publish_errors: u64::default(),
+            coordinator_await_got_artifact_duration: Duration::new(0, 0),
+            coordinator_await_wasted: u64::default(),
+            coordinator_await_wasted_duration: Duration::new(0, 0),
         }
     }
 }
@@ -1971,6 +1991,23 @@ impl ServerStats {
             stats_vec,
             self.coordinator_publish_errors,
             "Coordinator publishes failed"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_await_wasted,
+            "Coordinator awaits wasted"
+        );
+        set_duration_stat!(
+            stats_vec,
+            self.coordinator_await_got_artifact_duration,
+            self.coordinator_await_got_artifact,
+            "Average coordinator hit"
+        );
+        set_duration_stat!(
+            stats_vec,
+            self.coordinator_await_wasted_duration,
+            self.coordinator_await_wasted,
+            "Average coordinator miss"
         );
 
         // Add multi-level cache statistics if available
