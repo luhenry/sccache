@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cache::{Cache, CacheWrite, DecompressionFailure, FileObjectSource, Storage};
+use crate::cache::{Cache, CacheRead, CacheWrite, DecompressionFailure, FileObjectSource, Storage};
 use crate::compiler::args::*;
 use crate::compiler::c::{CCompiler, CCompilerKind};
 use crate::compiler::cicc::Cicc;
@@ -719,6 +719,59 @@ where
                         .await;
                 }
 
+                // Cluster-wide deduplication: ask the coordinator whether
+                // this node should compile or wait for a peer.
+                let lease_guard =
+                    match coordinate_for_compile(service, &*storage, &key, &out_pretty).await {
+                        Coordinated::Lead(g) => g,
+                        Coordinated::AwaitedHit {
+                            mut entry,
+                            await_duration,
+                        } => {
+                            let duration = start.elapsed();
+                            info!(
+                                "[{}]: coordinator: got peer's artifact in {}",
+                                out_pretty,
+                                fmt_duration_as_secs(&duration)
+                            );
+                            let output = process::Output {
+                                status: exit_status(0),
+                                stdout: entry.get_stdout(),
+                                stderr: entry.get_stderr(),
+                            };
+                            let filtered_outputs = if compilation.is_locally_preprocessed() {
+                                outputs.iter().filter(|f| f.key != "d").cloned().collect()
+                            } else {
+                                outputs.clone()
+                            };
+                            match entry.extract_objects(filtered_outputs, &pool).await {
+                                Ok(()) => {
+                                    let mut stats = service.stats.lock().await;
+                                    stats.coordinator_await_got_artifact += 1;
+                                    stats.coordinator_await_got_artifact_duration += await_duration;
+                                    drop(stats);
+                                    return Ok((CompileResult::CoordinatedHit(duration), output));
+                                }
+                                Err(e) => {
+                                    if e.downcast_ref::<DecompressionFailure>().is_some() {
+                                        debug!(
+                                            "[{}]: failed to decompress coordinated artifact",
+                                            out_pretty
+                                        );
+                                        let mut stats = service.stats.lock().await;
+                                        stats.coordinator_await_wasted += 1;
+                                        stats.coordinator_await_wasted_duration += await_duration;
+                                        drop(stats);
+                                        None
+                                    } else {
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                        }
+                        Coordinated::FallThrough => None,
+                    };
+
                 let (cacheable, dist_type, compiler_result) = dist_or_local_compile(
                     service,
                     dist_client,
@@ -784,11 +837,14 @@ where
                 );
 
                 let out_pretty2 = out_pretty.clone();
+                let coordinator = service.coordinator.clone();
+                let stats = service.stats.clone();
+                let lease = lease_guard;
                 // Try to finish storing the newly-written cache
                 // entry. We'll get the result back elsewhere.
                 let future = async move {
                     let start = Instant::now();
-                    match storage.put(&key, entry).await {
+                    let res = match storage.put(&key, entry).await {
                         Ok(_) => {
                             debug!("[{}]: Stored in cache successfully!", out_pretty2);
                             Ok(CacheWriteInfo {
@@ -797,7 +853,33 @@ where
                             })
                         }
                         Err(e) => Err(e),
+                    };
+                    {
+                        if res.is_ok() {
+                            // Order matters: the artifact must be in
+                            // storage before we wake any waiters.
+                            match coordinator.publish(&key).await {
+                                Ok(()) => {
+                                    stats.lock().await.coordinator_publish_sent += 1;
+                                    info!("coordinator: published artifact for waiters of {}", key);
+                                }
+                                Err(e) => {
+                                    stats.lock().await.coordinator_publish_errors += 1;
+                                    warn!(
+                                        "coordinator: publish of {} failed ({}); waiters will fall \
+                                         back to polling",
+                                        key, e
+                                    );
+                                }
+                            }
+                        }
+                        // Release the lease (if we held one) only after
+                        // publish, so a peer doesn't acquire it and
+                        // start a redundant compile in the gap between
+                        // our put and our publish.
+                        drop(lease);
                     }
+                    res
                 };
                 let future = Box::pin(future);
                 Ok((
@@ -1181,6 +1263,120 @@ macro_rules! try_or_cannot_cache {
     }};
 }
 
+/// Outcome of consulting the coordinator on a true cache miss. See
+/// `coordinate_for_compile`.
+enum Coordinated {
+    /// We acquired the lease; compile, then `put` + `publish`. `Some` on
+    /// real backends; `None` for the noop where the lease is meaningless.
+    Lead(Option<crate::coordinator::LeaseGuard>),
+    /// A peer's artifact landed in storage. Caller should `extract_objects`
+    /// and return `CompileResult::CoordinatedHit`. The duration we spent
+    /// waiting is preserved so the caller can attribute it to either
+    /// `coordinator_await_got_artifact_duration` (success) or
+    /// `coordinator_await_wasted_duration` (decompression failure).
+    AwaitedHit {
+        entry: CacheRead,
+        await_duration: Duration,
+    },
+    /// Compile redundantly: `Upgrade` / `Timeout` / `await_result` Err /
+    /// `coordinate` Err / non-Hit `GotArtifact`. Per-reason and "wasted"
+    /// stats are already counted before this is returned.
+    FallThrough,
+}
+
+/// Drive the coordinator and return a clean decision. Stats increments
+/// for every arm (lease acquired, await started, per-reason wasted /
+/// errors) live here; the caller only handles the `extract_objects`
+/// follow-up for the success path.
+async fn coordinate_for_compile<C>(
+    service: &server::SccacheService<C>,
+    storage: &dyn Storage,
+    key: &str,
+    out_pretty: &str,
+) -> Coordinated
+where
+    C: CommandCreatorSync + Clone + Send + Sync + 'static,
+{
+    use crate::coordinator::{CoordinationDecision, CoordinationOutcome};
+
+    match service.coordinator.coordinate(key).await {
+        Ok(CoordinationDecision::Compile(g)) => {
+            info!("[{}]: coordinator: leader for {}", out_pretty, key);
+            // Skip the bump on the noop coordinator; it would otherwise
+            // shadow `compilations` and obscure real backend engagement.
+            if service.coordinator.name() != "noop" {
+                service.stats.lock().await.coordinator_lease_acquired += 1;
+            }
+            Coordinated::Lead(Some(g))
+        }
+        Ok(CoordinationDecision::Await(handle)) => {
+            service.stats.lock().await.coordinator_await_started += 1;
+            info!(
+                "[{}]: coordinator: waiting on peer's compile of {}",
+                out_pretty, key
+            );
+            let await_start = Instant::now();
+            let outcome = handle.await_result(storage).await;
+            let await_duration = await_start.elapsed();
+            match outcome {
+                Ok(CoordinationOutcome::GotArtifact(Cache::Hit(entry))) => {
+                    Coordinated::AwaitedHit {
+                        entry,
+                        await_duration,
+                    }
+                }
+                Ok(CoordinationOutcome::GotArtifact(_)) => {
+                    let mut stats = service.stats.lock().await;
+                    stats.coordinator_await_wasted += 1;
+                    stats.coordinator_await_wasted_duration += await_duration;
+                    Coordinated::FallThrough
+                }
+                Ok(CoordinationOutcome::Upgrade) => {
+                    info!(
+                        "[{}]: coordinator: peer's lease expired before publish; compiling locally",
+                        out_pretty
+                    );
+                    let mut stats = service.stats.lock().await;
+                    stats.coordinator_await_upgraded += 1;
+                    stats.coordinator_await_wasted += 1;
+                    stats.coordinator_await_wasted_duration += await_duration;
+                    Coordinated::FallThrough
+                }
+                Ok(CoordinationOutcome::Timeout) => {
+                    warn!(
+                        "[{}]: coordinator: max_wait elapsed before peer published; compiling redundantly",
+                        out_pretty
+                    );
+                    let mut stats = service.stats.lock().await;
+                    stats.coordinator_await_timeout += 1;
+                    stats.coordinator_await_wasted += 1;
+                    stats.coordinator_await_wasted_duration += await_duration;
+                    Coordinated::FallThrough
+                }
+                Err(e) => {
+                    warn!(
+                        "[{}]: coordinator: await_result failed ({}); compiling locally",
+                        out_pretty, e
+                    );
+                    let mut stats = service.stats.lock().await;
+                    stats.coordinator_await_errors += 1;
+                    stats.coordinator_await_wasted += 1;
+                    stats.coordinator_await_wasted_duration += await_duration;
+                    Coordinated::FallThrough
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                "[{}]: coordinator: coordinate failed ({}); compiling without coordination",
+                out_pretty, e
+            );
+            service.stats.lock().await.coordinator_coordinate_errors += 1;
+            Coordinated::FallThrough
+        }
+    }
+}
+
 /// Specifics about distributed compilation.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DistType {
@@ -1219,6 +1415,11 @@ pub enum CompileResult {
     Error,
     /// Result was found in cache.
     CacheHit(Duration),
+    /// Cache missed locally, but a peer was already compiling this hash;
+    /// the coordinator awaited their result and we read the artifact
+    /// from storage. From the cache's point of view this is a miss --
+    /// no local compile happened, no cache write to schedule.
+    CoordinatedHit(Duration),
     /// Result was not found in cache.
     ///
     /// The `CacheWriteFuture` will resolve when the result is finished
@@ -1252,6 +1453,9 @@ impl fmt::Debug for CompileResult {
         match *self {
             CompileResult::Error => write!(f, "CompileResult::Error"),
             CompileResult::CacheHit(ref d) => write!(f, "CompileResult::CacheHit({:?})", d),
+            CompileResult::CoordinatedHit(ref d) => {
+                write!(f, "CompileResult::CoordinatedHit({:?})", d)
+            }
             CompileResult::CacheMiss(ref m, ref dt, ref d, _) => {
                 write!(f, "CompileResult::CacheMiss({:?}, {:?}, {:?}, _)", d, m, dt)
             }
@@ -1274,6 +1478,7 @@ impl PartialEq<CompileResult> for CompileResult {
         match (self, other) {
             (&CompileResult::Error, &CompileResult::Error) => true,
             (&CompileResult::CacheHit(_), &CompileResult::CacheHit(_)) => true,
+            (&CompileResult::CoordinatedHit(_), &CompileResult::CoordinatedHit(_)) => true,
             (CompileResult::CacheMiss(m, dt, _, _), CompileResult::CacheMiss(n, dt2, _, _)) => {
                 m == n && dt == dt2
             }
@@ -3671,5 +3876,171 @@ mod test_dist {
         fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod coordinator_tests {
+    use super::{Coordinated, coordinate_for_compile};
+    use crate::cache::{Cache, CacheRead};
+    use crate::coordinator::mock::{MockCoordinator, MockDecision, MockOutcome};
+    use crate::coordinator::{BuildCoordinator, NoopCoordinator};
+    use crate::mock_command::MockCommandCreator;
+    use crate::server::ServerStats;
+    use crate::test::mock_storage::MockStorage;
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::runtime::Runtime;
+
+    type Svc = crate::server::SccacheService<Arc<Mutex<MockCommandCreator>>>;
+
+    fn build_svc(coord: Arc<dyn BuildCoordinator>) -> (Runtime, Svc, Arc<MockStorage>) {
+        let rt = Runtime::new().unwrap();
+        let storage = Arc::new(MockStorage::new(None, false));
+        let svc =
+            Svc::mock_with_storage_and_coordinator(storage.clone(), coord, rt.handle().clone());
+        (rt, svc, storage)
+    }
+
+    async fn snapshot(svc: &Svc) -> ServerStats {
+        svc.stats.lock().await.clone()
+    }
+
+    #[test]
+    fn noop_returns_lead_without_lease_acquired_bump() {
+        let (rt, svc, storage) = build_svc(Arc::new(NoopCoordinator::new()));
+        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o"));
+        assert!(matches!(result, Coordinated::Lead(Some(_))));
+        let s = rt.block_on(snapshot(&svc));
+        // Noop is excluded from the leader counter on purpose; with the
+        // noop backend `compilations` already covers it.
+        assert_eq!(s.coordinator_lease_acquired, 0);
+        assert_eq!(s.coordinator_await_started, 0);
+    }
+
+    #[test]
+    fn real_backend_compile_decision_bumps_lease_acquired() {
+        let mock = Arc::new(MockCoordinator::new("mock"));
+        mock.enqueue(MockDecision::Compile);
+        let (rt, svc, storage) = build_svc(mock);
+        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o"));
+        assert!(matches!(result, Coordinated::Lead(Some(_))));
+        let s = rt.block_on(snapshot(&svc));
+        assert_eq!(s.coordinator_lease_acquired, 1);
+        assert_eq!(s.coordinator_await_started, 0);
+        assert_eq!(s.coordinator_await_wasted, 0);
+    }
+
+    #[test]
+    fn await_got_cache_hit_returns_awaited_hit_with_duration() {
+        let mock = Arc::new(MockCoordinator::new("mock"));
+        mock.enqueue(MockDecision::Await(MockOutcome::GotArtifactFromStorage));
+        let (rt, svc, storage) = build_svc(mock);
+        // Pre-seed the storage with a Cache::Hit (an empty but valid
+        // zip) so the mock's `await_result` resolves to GotArtifact(Hit).
+        let entry_bytes = crate::cache::CacheWrite::new().finish().unwrap();
+        storage.next_get(Ok(Cache::Hit(
+            CacheRead::from(Cursor::new(entry_bytes)).unwrap(),
+        )));
+        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o"));
+        match result {
+            Coordinated::AwaitedHit {
+                entry: _,
+                await_duration,
+            } => {
+                // Duration is captured but may be sub-microsecond
+                // under MockStorage; just assert it was measured.
+                assert!(await_duration <= Duration::from_secs(1));
+            }
+            other => panic!(
+                "expected AwaitedHit, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+        let s = rt.block_on(snapshot(&svc));
+        assert_eq!(s.coordinator_await_started, 1);
+        assert_eq!(s.coordinator_await_wasted, 0);
+        // The got_artifact bump happens at the call site after a
+        // successful `extract_objects`, not in the helper.
+        assert_eq!(s.coordinator_await_got_artifact, 0);
+    }
+
+    #[test]
+    fn await_got_non_hit_falls_through_and_counts_as_wasted() {
+        let mock = Arc::new(MockCoordinator::new("mock"));
+        mock.enqueue(MockDecision::Await(MockOutcome::GotArtifactFromStorage));
+        let (rt, svc, storage) = build_svc(mock);
+        // Storage returns a Miss -> GotArtifact(Miss) -> wasted in helper.
+        storage.next_get(Ok(Cache::Miss));
+        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o"));
+        assert!(matches!(result, Coordinated::FallThrough));
+        let s = rt.block_on(snapshot(&svc));
+        assert_eq!(s.coordinator_await_started, 1);
+        assert_eq!(s.coordinator_await_wasted, 1);
+        assert!(s.coordinator_await_wasted_duration <= Duration::from_secs(1));
+        // No per-reason counter -- this is the defensive non-Hit arm.
+        assert_eq!(s.coordinator_await_upgraded, 0);
+        assert_eq!(s.coordinator_await_timeout, 0);
+        assert_eq!(s.coordinator_await_errors, 0);
+    }
+
+    #[test]
+    fn await_upgrade_falls_through_and_bumps_upgraded_plus_wasted() {
+        let mock = Arc::new(MockCoordinator::new("mock"));
+        mock.enqueue(MockDecision::Await(MockOutcome::Upgrade));
+        let (rt, svc, storage) = build_svc(mock);
+        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o"));
+        assert!(matches!(result, Coordinated::FallThrough));
+        let s = rt.block_on(snapshot(&svc));
+        assert_eq!(s.coordinator_await_started, 1);
+        assert_eq!(s.coordinator_await_upgraded, 1);
+        assert_eq!(s.coordinator_await_wasted, 1);
+        assert_eq!(s.coordinator_await_timeout, 0);
+        assert_eq!(s.coordinator_await_errors, 0);
+    }
+
+    #[test]
+    fn await_timeout_falls_through_and_bumps_timeout_plus_wasted() {
+        let mock = Arc::new(MockCoordinator::new("mock"));
+        mock.enqueue(MockDecision::Await(MockOutcome::Timeout));
+        let (rt, svc, storage) = build_svc(mock);
+        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o"));
+        assert!(matches!(result, Coordinated::FallThrough));
+        let s = rt.block_on(snapshot(&svc));
+        assert_eq!(s.coordinator_await_started, 1);
+        assert_eq!(s.coordinator_await_timeout, 1);
+        assert_eq!(s.coordinator_await_wasted, 1);
+        assert_eq!(s.coordinator_await_upgraded, 0);
+        assert_eq!(s.coordinator_await_errors, 0);
+    }
+
+    #[test]
+    fn await_result_error_falls_through_and_bumps_errors_plus_wasted() {
+        let mock = Arc::new(MockCoordinator::new("mock"));
+        mock.enqueue(MockDecision::Await(MockOutcome::Error));
+        let (rt, svc, storage) = build_svc(mock);
+        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o"));
+        assert!(matches!(result, Coordinated::FallThrough));
+        let s = rt.block_on(snapshot(&svc));
+        assert_eq!(s.coordinator_await_started, 1);
+        assert_eq!(s.coordinator_await_errors, 1);
+        assert_eq!(s.coordinator_await_wasted, 1);
+        assert_eq!(s.coordinator_await_upgraded, 0);
+        assert_eq!(s.coordinator_await_timeout, 0);
+    }
+
+    #[test]
+    fn coordinate_error_bumps_coordinate_errors_only() {
+        let mock = Arc::new(MockCoordinator::new("mock"));
+        mock.enqueue(MockDecision::CoordinateError);
+        let (rt, svc, storage) = build_svc(mock);
+        let result = rt.block_on(coordinate_for_compile(&svc, &*storage, "k", "out.o"));
+        assert!(matches!(result, Coordinated::FallThrough));
+        let s = rt.block_on(snapshot(&svc));
+        assert_eq!(s.coordinator_coordinate_errors, 1);
+        // No wait happened; await counters stay clean.
+        assert_eq!(s.coordinator_await_started, 0);
+        assert_eq!(s.coordinator_await_wasted, 0);
     }
 }

@@ -21,6 +21,7 @@ use crate::compiler::{
 #[cfg(feature = "dist-client")]
 use crate::config;
 use crate::config::Config;
+use crate::coordinator::{BuildCoordinator, NoopCoordinator};
 use crate::dist;
 use crate::jobserver::Client;
 use crate::mock_command::{CommandCreatorSync, ProcessCommandCreator};
@@ -423,6 +424,14 @@ thread_local! {
     static PANIC_LOCATION: Cell<Option<(String, u32, u32)>> = const { Cell::new(None) };
 }
 
+/// Build the cluster-wide build coordinator from config. Falls back to
+/// the no-op coordinator when no backend is configured, when a
+/// configured backend fails to initialize, or when the configured
+/// backend is gated out by the active Cargo features.
+fn build_coordinator(_config: &Config, _runtime: &Runtime) -> Arc<dyn BuildCoordinator> {
+    Arc::new(NoopCoordinator::new())
+}
+
 /// Start an sccache server, listening on `addr`.
 ///
 /// Spins an event loop handling client connections until a client
@@ -489,13 +498,21 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
         _ => raw_storage,
     };
 
+    let coordinator = build_coordinator(config, &runtime);
+
     let res: io::Result<(crate::net::SocketAddr, Box<dyn FnOnce(_) -> io::Result<()>>)> = (|| {
         match addr {
             crate::net::SocketAddr::Net(addr) => {
                 trace!("binding TCP {addr}");
                 let l = runtime.block_on(tokio::net::TcpListener::bind(addr))?;
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                let srv = SccacheServer::<_>::with_listener(
+                    l,
+                    runtime,
+                    client,
+                    dist_client,
+                    storage,
+                    coordinator,
+                );
                 Ok((
                     srv.local_addr().unwrap(),
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
@@ -510,8 +527,14 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     let _guard = runtime.enter();
                     tokio::net::UnixListener::bind(path)?
                 };
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                let srv = SccacheServer::<_>::with_listener(
+                    l,
+                    runtime,
+                    client,
+                    dist_client,
+                    storage,
+                    coordinator,
+                );
                 Ok((
                     srv.local_addr().unwrap(),
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
@@ -527,8 +550,14 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     let _guard = runtime.enter();
                     tokio::net::UnixListener::from_std(l)?
                 };
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                let srv = SccacheServer::<_>::with_listener(
+                    l,
+                    runtime,
+                    client,
+                    dist_client,
+                    storage,
+                    coordinator,
+                );
                 Ok((
                     srv.local_addr()
                         .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(p.clone())),
@@ -584,6 +613,7 @@ impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
         client: Client,
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
+        coordinator: Arc<dyn BuildCoordinator>,
     ) -> Result<Self> {
         let addr = crate::net::SocketAddr::with_port(port);
         let listener = runtime.block_on(tokio::net::TcpListener::bind(addr.as_net().unwrap()))?;
@@ -594,6 +624,7 @@ impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
             client,
             dist_client,
             storage,
+            coordinator,
         ))
     }
 }
@@ -605,13 +636,15 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         client: Client,
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
+        coordinator: Arc<dyn BuildCoordinator>,
     ) -> Self {
         // Prepare the service which we'll use to service all incoming TCP
         // connections.
         let (tx, rx) = mpsc::channel(1);
         let (wait, info) = WaitUntilZero::new();
         let pool = runtime.handle().clone();
-        let service = SccacheService::new(dist_client, storage, &client, pool, tx, info);
+        let service =
+            SccacheService::new(dist_client, storage, coordinator, &client, pool, tx, info);
 
         SccacheServer {
             runtime,
@@ -784,13 +817,17 @@ where
     C: Send,
 {
     /// Server statistics.
-    stats: Arc<Mutex<ServerStats>>,
+    pub(crate) stats: Arc<Mutex<ServerStats>>,
 
     /// Distributed sccache client
     dist_client: Arc<DistClientContainer>,
 
     /// Cache storage.
     storage: Arc<dyn Storage>,
+
+    /// Cluster-wide build coordinator. Defaults to a no-op that always
+    /// tells the caller to compile locally.
+    pub(crate) coordinator: Arc<dyn BuildCoordinator>,
 
     /// A cache of known compiler info.
     compilers: Arc<RwLock<CompilerMap<C>>>,
@@ -917,6 +954,7 @@ where
     pub fn new(
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
+        coordinator: Arc<dyn BuildCoordinator>,
         client: &Client,
         rt: tokio::runtime::Handle,
         tx: mpsc::Sender<ServerMessage>,
@@ -926,6 +964,7 @@ where
             stats: Arc::default(),
             dist_client: Arc::new(dist_client),
             storage,
+            coordinator,
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt,
@@ -939,6 +978,17 @@ where
         storage: Arc<dyn Storage>,
         rt: tokio::runtime::Handle,
     ) -> SccacheService<C> {
+        Self::mock_with_storage_and_coordinator(storage, Arc::new(NoopCoordinator::new()), rt)
+    }
+
+    /// `mock_with_storage` with a caller-supplied coordinator. Lets tests
+    /// inject `MockCoordinator` to drive the coordinator paths in
+    /// `compiler::CompilerHasher::get_cached_or_compile`.
+    pub fn mock_with_storage_and_coordinator(
+        storage: Arc<dyn Storage>,
+        coordinator: Arc<dyn BuildCoordinator>,
+        rt: tokio::runtime::Handle,
+    ) -> SccacheService<C> {
         let (tx, _) = mpsc::channel(1);
         let (_, info) = WaitUntilZero::new();
         let client = Client::new_num(1);
@@ -947,6 +997,7 @@ where
             stats: Arc::default(),
             dist_client: Arc::new(dist_client),
             storage,
+            coordinator,
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt,
@@ -982,6 +1033,7 @@ where
                 dist_client,
             ))),
             storage,
+            coordinator: Arc::new(NoopCoordinator::new()),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt: rt.clone(),
@@ -1393,6 +1445,17 @@ where
                                 stats.cache_hits.increment(&kind, &lang);
                                 stats.cache_read_hit_duration += duration;
                             }
+                            CompileResult::CoordinatedHit(_duration) => {
+                                debug!("compile result: coordinator-deduplicated miss");
+
+                                // Local cache lookup did miss; the artifact
+                                // was only in storage because a peer just
+                                // put it there. Count as a miss so headline
+                                // hit-rate stays honest, and skip the
+                                // `compilations` bump because we did not
+                                // compile.
+                                stats.cache_misses.increment(&kind, &lang);
+                            }
                             CompileResult::CacheMiss(miss_type, dt, duration, future) => {
                                 debug!("[{}]: compile result: cache miss", out_pretty);
                                 dist_type = dt;
@@ -1629,6 +1692,60 @@ pub struct ServerStats {
     pub dist_errors: u64,
     /// Multi-level cache statistics (if multi-level caching is enabled)
     pub multi_level: Option<crate::cache::multilevel::MultiLevelStats>,
+    /// Times we acquired a coordinator lease (we became the leader for a
+    /// cache-miss compile that no peer was already holding). The noop
+    /// coordinator's "lease" is uncounted -- the noop path always returns
+    /// `Compile` and would equal `compilations`, which is meaningless.
+    #[serde(default)]
+    pub coordinator_lease_acquired: u64,
+    /// Times we entered the await path (a peer was already compiling this
+    /// hash when we hit a cache miss).
+    #[serde(default)]
+    pub coordinator_await_started: u64,
+    /// Of those awaits, the count that actually paid off: the peer's
+    /// artifact landed in storage, we fetched it, and decompression
+    /// succeeded. This is the real coordination win.
+    #[serde(default)]
+    pub coordinator_await_got_artifact: u64,
+    /// Awaits that fell through because the peer's lease expired before
+    /// the peer published (`CoordinationOutcome::Upgrade`).
+    #[serde(default)]
+    pub coordinator_await_upgraded: u64,
+    /// Awaits that fell through because `max_wait` elapsed
+    /// (`CoordinationOutcome::Timeout`).
+    #[serde(default)]
+    pub coordinator_await_timeout: u64,
+    /// Awaits that fell through because `await_result` returned an error.
+    #[serde(default)]
+    pub coordinator_await_errors: u64,
+    /// Calls to `coordinate()` that returned an error. The caller falls
+    /// through to a local compile in this case.
+    #[serde(default)]
+    pub coordinator_coordinate_errors: u64,
+    /// Successful publishes the leader sent (one per cache-miss compile
+    /// whose artifact was successfully written to storage).
+    #[serde(default)]
+    pub coordinator_publish_sent: u64,
+    /// Publish calls that failed.
+    #[serde(default)]
+    pub coordinator_publish_errors: u64,
+    /// Total wall-clock time spent waiting on peers in the awaits that
+    /// actually paid off (peer's artifact landed and we used it). Divide
+    /// by `coordinator_await_got_artifact` to get the average.
+    #[serde(default)]
+    pub coordinator_await_got_artifact_duration: Duration,
+    /// Number of awaits that did NOT pay off: we waited and then fell
+    /// through to a local compile (peer's lease expired, max_wait elapsed,
+    /// `await_result` errored, decompression failed, or a non-Hit
+    /// `GotArtifact`). The sum of `coordinator_await_upgraded`,
+    /// `coordinator_await_timeout`, `coordinator_await_errors`, plus the
+    /// non-counter fall-through arms.
+    #[serde(default)]
+    pub coordinator_await_wasted: u64,
+    /// Total wall-clock time spent on the wasted awaits above. Divide by
+    /// `coordinator_await_wasted` to get the average wasted wait.
+    #[serde(default)]
+    pub coordinator_await_wasted_duration: Duration,
 }
 
 /// Info and stats about the server.
@@ -1679,6 +1796,18 @@ impl Default for ServerStats {
             dist_compiles: HashMap::new(),
             dist_errors: u64::default(),
             multi_level: None,
+            coordinator_lease_acquired: u64::default(),
+            coordinator_await_started: u64::default(),
+            coordinator_await_got_artifact: u64::default(),
+            coordinator_await_upgraded: u64::default(),
+            coordinator_await_timeout: u64::default(),
+            coordinator_await_errors: u64::default(),
+            coordinator_coordinate_errors: u64::default(),
+            coordinator_publish_sent: u64::default(),
+            coordinator_publish_errors: u64::default(),
+            coordinator_await_got_artifact_duration: Duration::new(0, 0),
+            coordinator_await_wasted: u64::default(),
+            coordinator_await_wasted_duration: Duration::new(0, 0),
         }
     }
 }
@@ -1813,6 +1942,74 @@ impl ServerStats {
             stats_vec,
             self.dist_errors,
             "Failed distributed compilations"
+        );
+
+        // Coordinator stats. Stay zero with the noop coordinator, which is
+        // useful in itself: a real backend that never engages here will be
+        // visible as a row of zeros, while a healthy redis backend will
+        // show non-zero `lease acquired` and (for n>1 nodes) non-zero
+        // `await: got artifact`.
+        set_stat!(
+            stats_vec,
+            self.coordinator_lease_acquired,
+            "Coordinator leases acquired"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_await_started,
+            "Coordinator awaits started"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_await_got_artifact,
+            "Coordinator awaits cache hit"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_await_upgraded,
+            "Coordinator awaits stale lease"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_await_timeout,
+            "Coordinator awaits timed out"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_await_errors,
+            "Coordinator awaits errors"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_coordinate_errors,
+            "Coordinator coordinate errors"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_publish_sent,
+            "Coordinator publishes sent"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_publish_errors,
+            "Coordinator publishes failed"
+        );
+        set_stat!(
+            stats_vec,
+            self.coordinator_await_wasted,
+            "Coordinator awaits wasted"
+        );
+        set_duration_stat!(
+            stats_vec,
+            self.coordinator_await_got_artifact_duration,
+            self.coordinator_await_got_artifact,
+            "Average coordinator hit"
+        );
+        set_duration_stat!(
+            stats_vec,
+            self.coordinator_await_wasted_duration,
+            self.coordinator_await_wasted,
+            "Average coordinator miss"
         );
 
         // Add multi-level cache statistics if available

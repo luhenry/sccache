@@ -759,6 +759,19 @@ impl Default for DistConfig {
     }
 }
 
+/// Cluster-wide build coordinator configuration. Backends slot in as
+/// fields on this struct as they land.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinatorConfigs {}
+
+impl CoordinatorConfigs {
+    /// Per-field merge of an env-derived config over a file-derived
+    /// one. Empty today; backends extend it as they land.
+    fn merge(&mut self, _other: Self) {}
+}
+
 // TODO: fields only pub for tests
 #[derive(Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default)]
@@ -766,6 +779,7 @@ impl Default for DistConfig {
 pub struct FileConfig {
     pub cache: CacheConfigs,
     pub dist: DistConfig,
+    pub coordinator: CoordinatorConfigs,
     pub server_startup_timeout_ms: Option<u64>,
     /// Base directories to strip from paths for cache key computation.
     pub basedirs: Vec<String>,
@@ -806,6 +820,7 @@ pub fn try_read_config_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T
 #[derive(Debug)]
 pub struct EnvConfig {
     cache: CacheConfigs,
+    coordinator: CoordinatorConfigs,
     basedirs: Option<Vec<String>>,
 }
 
@@ -1180,7 +1195,13 @@ fn config_from_env() -> Result<EnvConfig> {
             .collect()
     });
 
-    Ok(EnvConfig { cache, basedirs })
+    let coordinator = CoordinatorConfigs::default();
+
+    Ok(EnvConfig {
+        cache,
+        coordinator,
+        basedirs,
+    })
 }
 
 // The directories crate changed the location of `config_dir` on macos in version 3,
@@ -1212,6 +1233,7 @@ pub struct Config {
     pub cache_configs: CacheConfigs,
     pub fallback_cache: DiskCacheConfig,
     pub dist: DistConfig,
+    pub coordinator: CoordinatorConfigs,
     pub server_startup_timeout: Option<std::time::Duration>,
     /// Base directory (or directories) to strip from paths for cache key computation.
     /// Similar to ccache's CCACHE_BASEDIR.
@@ -1236,6 +1258,7 @@ impl Config {
         let FileConfig {
             cache,
             dist,
+            mut coordinator,
             server_startup_timeout_ms,
             basedirs: file_basedirs,
         } = file_conf;
@@ -1246,9 +1269,13 @@ impl Config {
 
         let EnvConfig {
             cache,
+            coordinator: env_coordinator,
             basedirs: env_basedirs,
         } = env_conf;
         conf_caches.merge(cache);
+        // Env-set coordinator backends override the file's per-field
+        // (today: only redis). Mirrors `conf_caches.merge` above.
+        coordinator.merge(env_coordinator);
 
         // Environment variable takes precedence over file config if it is set
         let basedirs_raw = if let Some(basedirs) = env_basedirs {
@@ -1306,6 +1333,7 @@ impl Config {
             cache_configs: conf_caches,
             fallback_cache,
             dist,
+            coordinator,
             server_startup_timeout,
             basedirs,
         })
@@ -1582,6 +1610,7 @@ fn config_overrides() {
             ..Default::default()
         },
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1609,6 +1638,7 @@ fn config_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        coordinator: Default::default(),
     };
 
     assert_eq!(
@@ -1661,6 +1691,7 @@ fn config_overrides() {
             dist: Default::default(),
             server_startup_timeout: None,
             basedirs: vec![],
+            coordinator: Default::default(),
         }
     );
 }
@@ -1672,6 +1703,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec!["C:/env/basedir".to_string()].into(),
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1679,6 +1711,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1688,6 +1721,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1695,6 +1729,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1704,6 +1739,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec![].into(),
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1711,6 +1747,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1720,6 +1757,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec![].into(),
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1727,6 +1765,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1740,6 +1779,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec!["/env/basedir".to_string()].into(),
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1747,6 +1787,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1756,6 +1797,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1763,6 +1805,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1772,6 +1815,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec![].into(),
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1779,6 +1823,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1788,6 +1833,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: vec![].into(),
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1795,6 +1841,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1802,6 +1849,7 @@ fn config_basedirs_overrides() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1809,6 +1857,7 @@ fn config_basedirs_overrides() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1967,6 +2016,7 @@ fn test_env_basedirs_with_spaces() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        coordinator: Default::default(),
     };
     Config::from_env_and_file_configs(env_conf, file_conf)
         .expect_err("Should fail due to non-absolute path");
@@ -2001,6 +2051,7 @@ fn test_env_basedirs_with_spaces() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        coordinator: Default::default(),
     };
     Config::from_env_and_file_configs(env_conf, file_conf)
         .expect_err("Should fail due to non-absolute path");
@@ -2383,6 +2434,7 @@ key_prefix = "cosprefix"
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
+            coordinator: Default::default(),
         }
     );
 }
@@ -2476,6 +2528,7 @@ size = "7g"
             },
             server_startup_timeout_ms: None,
             basedirs: vec![],
+            coordinator: Default::default(),
         }
     );
 }
@@ -2492,6 +2545,7 @@ fn test_integration_config_normalizes_and_strips() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2499,6 +2553,7 @@ fn test_integration_config_normalizes_and_strips() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/project".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2525,6 +2580,7 @@ fn test_integration_normalized_path_with_double_slashes() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2532,6 +2588,7 @@ fn test_integration_normalized_path_with_double_slashes() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home//user///project/".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2554,6 +2611,7 @@ fn test_integration_windows_path_normalization() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2561,6 +2619,7 @@ fn test_integration_windows_path_normalization() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:\\Users\\Test\\Project".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2584,6 +2643,7 @@ fn test_integration_cow_borrowed_when_no_match() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2591,6 +2651,7 @@ fn test_integration_cow_borrowed_when_no_match() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/project".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2614,6 +2675,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2621,6 +2683,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2643,6 +2706,7 @@ fn test_integration_multiple_basedirs_longest_match() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2650,6 +2714,7 @@ fn test_integration_multiple_basedirs_longest_match() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user".to_string(), "/home/user/project".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2677,6 +2742,7 @@ fn test_integration_paths_with_dots_normalized() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2684,6 +2750,7 @@ fn test_integration_paths_with_dots_normalized() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/./project/../project".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2707,6 +2774,7 @@ fn test_integration_windows_mixed_slashes() {
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
+        coordinator: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2714,6 +2782,7 @@ fn test_integration_windows_mixed_slashes() {
         dist: Default::default(),
         server_startup_timeout_ms: None,
         basedirs: vec!["C:\\Users\\test\\project".to_string()],
+        coordinator: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();

@@ -60,6 +60,7 @@ fn config_with_dist_auth(
         },
         server_startup_timeout_ms: None,
         basedirs: vec![],
+        coordinator: Default::default(),
     }
 }
 
