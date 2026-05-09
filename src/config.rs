@@ -759,17 +759,73 @@ impl Default for DistConfig {
     }
 }
 
-/// Cluster-wide build coordinator configuration. Backends slot in as
-/// fields on this struct as they land.
+/// Cluster-wide build coordinator configuration.
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
-pub struct CoordinatorConfigs {}
+pub struct CoordinatorConfigs {
+    pub redis: Option<RedisCoordinatorConfig>,
+}
 
 impl CoordinatorConfigs {
-    /// Per-field merge of an env-derived config over a file-derived
-    /// one. Empty today; backends extend it as they land.
-    fn merge(&mut self, _other: Self) {}
+    /// Per-field merge: if `other.redis` is `Some`, it replaces
+    /// `self.redis`. Future backends slot in next to it.
+    fn merge(&mut self, other: Self) {
+        let CoordinatorConfigs { redis } = other;
+        if redis.is_some() {
+            self.redis = redis;
+        }
+    }
+}
+
+/// Redis-backed coordinator: leases via `SET NX EX`, heartbeat via
+/// `EXPIRE`, conditional release via Lua, and pubsub for fast waiter
+/// wakeup. The lease store is small and short-lived, so this can share
+/// an instance / logical database with a Redis cache backend.
+///
+/// Config shape mirrors `[cache.redis]`: `endpoint` + `db` plus
+/// optional `username` / `password` for AUTH.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisCoordinatorConfig {
+    /// Redis endpoint, e.g. `tcp://host:6379` or `redis://host:6379`.
+    pub endpoint: String,
+    /// Username for AUTH. Optional; matches `[cache.redis]`.
+    pub username: Option<String>,
+    /// Password for AUTH. Optional; matches `[cache.redis]`.
+    pub password: Option<String>,
+    /// Logical database index. Defaults to 0.
+    #[serde(default)]
+    pub db: u32,
+    /// Backstop TTL refreshed via heartbeat. If a leader crashes, the
+    /// lease expires within this window and a waiter can take over.
+    #[serde(default = "default_lease_ttl_secs")]
+    pub lease_ttl_secs: u64,
+    /// How often the leader refreshes its lease. Conventionally 1/3
+    /// of `lease_ttl_secs`.
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+    /// Hard ceiling on how long a waiter blocks before falling
+    /// through to a redundant local compile.
+    #[serde(default = "default_max_wait_secs")]
+    pub max_wait_secs: u64,
+    /// Polling fallback interval. Catches lost pubsub notifications
+    /// and detects crashed leaders before the full deadline.
+    #[serde(default = "default_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+}
+
+fn default_lease_ttl_secs() -> u64 {
+    60
+}
+fn default_heartbeat_interval_secs() -> u64 {
+    20
+}
+fn default_max_wait_secs() -> u64 {
+    600
+}
+fn default_poll_interval_secs() -> u64 {
+    2
 }
 
 // TODO: fields only pub for tests
@@ -1195,7 +1251,46 @@ fn config_from_env() -> Result<EnvConfig> {
             .collect()
     });
 
-    let coordinator = CoordinatorConfigs::default();
+    // ======= Coordinator (Redis) =======
+    // Trigger: SCCACHE_COORDINATOR_REDIS_ENDPOINT. If set, build a
+    // full RedisCoordinatorConfig from env vars; the four tunables
+    // fall back to their TOML defaults when their env vars are unset.
+    let coordinator_redis = if let Ok(endpoint) = env::var("SCCACHE_COORDINATOR_REDIS_ENDPOINT") {
+        let username = env::var("SCCACHE_COORDINATOR_REDIS_USERNAME").ok();
+        let password = env::var("SCCACHE_COORDINATOR_REDIS_PASSWORD").ok();
+        let db = number_from_env_var::<u32>("SCCACHE_COORDINATOR_REDIS_DB")
+            .transpose()?
+            .unwrap_or(0);
+        let lease_ttl_secs = number_from_env_var::<u64>("SCCACHE_COORDINATOR_REDIS_LEASE_TTL_SECS")
+            .transpose()?
+            .unwrap_or_else(default_lease_ttl_secs);
+        let heartbeat_interval_secs =
+            number_from_env_var::<u64>("SCCACHE_COORDINATOR_REDIS_HEARTBEAT_INTERVAL_SECS")
+                .transpose()?
+                .unwrap_or_else(default_heartbeat_interval_secs);
+        let max_wait_secs = number_from_env_var::<u64>("SCCACHE_COORDINATOR_REDIS_MAX_WAIT_SECS")
+            .transpose()?
+            .unwrap_or_else(default_max_wait_secs);
+        let poll_interval_secs =
+            number_from_env_var::<u64>("SCCACHE_COORDINATOR_REDIS_POLL_INTERVAL_SECS")
+                .transpose()?
+                .unwrap_or_else(default_poll_interval_secs);
+        Some(RedisCoordinatorConfig {
+            endpoint,
+            username,
+            password,
+            db,
+            lease_ttl_secs,
+            heartbeat_interval_secs,
+            max_wait_secs,
+            poll_interval_secs,
+        })
+    } else {
+        None
+    };
+    let coordinator = CoordinatorConfigs {
+        redis: coordinator_redis,
+    };
 
     Ok(EnvConfig {
         cache,
@@ -1569,6 +1664,132 @@ pub mod server {
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
         super::try_read_config_file(conf_path).context("Failed to load server config file")
     }
+}
+
+#[test]
+#[serial]
+fn test_coordinator_redis_env_only() {
+    use temp_env::with_vars;
+    with_vars(
+        [
+            ("SCCACHE_COORDINATOR_REDIS_ENDPOINT", Some("tcp://r:6379")),
+            ("SCCACHE_COORDINATOR_REDIS_USERNAME", Some("u")),
+            ("SCCACHE_COORDINATOR_REDIS_PASSWORD", Some("p")),
+            ("SCCACHE_COORDINATOR_REDIS_DB", Some("3")),
+            ("SCCACHE_COORDINATOR_REDIS_LEASE_TTL_SECS", Some("90")),
+        ],
+        || {
+            let env_conf = config_from_env().unwrap();
+            let cfg = env_conf
+                .coordinator
+                .redis
+                .as_ref()
+                .expect("env-trigger should produce a redis coordinator config");
+            assert_eq!(cfg.endpoint, "tcp://r:6379");
+            assert_eq!(cfg.username.as_deref(), Some("u"));
+            assert_eq!(cfg.password.as_deref(), Some("p"));
+            assert_eq!(cfg.db, 3);
+            assert_eq!(cfg.lease_ttl_secs, 90);
+            // Untuned fields fall back to TOML defaults.
+            assert_eq!(cfg.heartbeat_interval_secs, 20);
+            assert_eq!(cfg.max_wait_secs, 600);
+            assert_eq!(cfg.poll_interval_secs, 2);
+        },
+    );
+}
+
+#[test]
+#[serial]
+fn test_coordinator_redis_env_unset_means_no_env_redis() {
+    use temp_env::with_vars;
+    with_vars(
+        [
+            ("SCCACHE_COORDINATOR_REDIS_ENDPOINT", None::<&str>),
+            // Tunables alone (without the trigger) must NOT enable
+            // the coordinator -- mirrors `SCCACHE_BUCKET` semantics
+            // for s3.
+            ("SCCACHE_COORDINATOR_REDIS_DB", Some("3")),
+            ("SCCACHE_COORDINATOR_REDIS_USERNAME", Some("u")),
+        ],
+        || {
+            let env_conf = config_from_env().unwrap();
+            assert!(env_conf.coordinator.redis.is_none());
+        },
+    );
+}
+
+#[test]
+#[serial]
+fn test_coordinator_redis_env_overrides_file() {
+    use temp_env::with_vars;
+    with_vars(
+        [(
+            "SCCACHE_COORDINATOR_REDIS_ENDPOINT",
+            Some("tcp://from-env:6379"),
+        )],
+        || {
+            let env_conf = config_from_env().unwrap();
+            let file_conf = FileConfig {
+                cache: Default::default(),
+                dist: Default::default(),
+                coordinator: CoordinatorConfigs {
+                    redis: Some(RedisCoordinatorConfig {
+                        endpoint: "tcp://from-file:6379".to_string(),
+                        username: None,
+                        password: None,
+                        db: 7,
+                        lease_ttl_secs: 30,
+                        heartbeat_interval_secs: 10,
+                        max_wait_secs: 100,
+                        poll_interval_secs: 1,
+                    }),
+                },
+                server_startup_timeout_ms: None,
+                basedirs: vec![],
+            };
+            let merged = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
+            let redis = merged
+                .coordinator
+                .redis
+                .expect("merged config should keep a redis coordinator");
+            assert_eq!(redis.endpoint, "tcp://from-env:6379");
+        },
+    );
+}
+
+#[test]
+#[serial]
+fn test_coordinator_redis_env_unset_keeps_file() {
+    use temp_env::with_vars;
+    with_vars(
+        [("SCCACHE_COORDINATOR_REDIS_ENDPOINT", None::<&str>)],
+        || {
+            let env_conf = config_from_env().unwrap();
+            let file_conf = FileConfig {
+                cache: Default::default(),
+                dist: Default::default(),
+                coordinator: CoordinatorConfigs {
+                    redis: Some(RedisCoordinatorConfig {
+                        endpoint: "tcp://from-file:6379".to_string(),
+                        username: None,
+                        password: None,
+                        db: 0,
+                        lease_ttl_secs: 60,
+                        heartbeat_interval_secs: 20,
+                        max_wait_secs: 600,
+                        poll_interval_secs: 2,
+                    }),
+                },
+                server_startup_timeout_ms: None,
+                basedirs: vec![],
+            };
+            let merged = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
+            assert_eq!(
+                merged.coordinator.redis.unwrap().endpoint,
+                "tcp://from-file:6379"
+            );
+        },
+    );
 }
 
 #[test]

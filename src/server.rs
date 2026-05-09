@@ -428,7 +428,27 @@ thread_local! {
 /// the no-op coordinator when no backend is configured, when a
 /// configured backend fails to initialize, or when the configured
 /// backend is gated out by the active Cargo features.
-fn build_coordinator(_config: &Config, _runtime: &Runtime) -> Arc<dyn BuildCoordinator> {
+fn build_coordinator(
+    config: &Config,
+    #[cfg_attr(not(feature = "coordinator"), allow(unused_variables))] runtime: &Runtime,
+) -> Arc<dyn BuildCoordinator> {
+    #[cfg(feature = "coordinator")]
+    if let Some(redis_cfg) = &config.coordinator.redis {
+        match runtime.block_on(crate::coordinator::RedisLeaseCoordinator::new(redis_cfg)) {
+            Ok(c) => {
+                info!("coordinator: redis at {}", redis_cfg.endpoint);
+                return Arc::new(c);
+            }
+            Err(e) => warn!("coordinator: redis init failed ({e}); falling back to noop"),
+        }
+    }
+    #[cfg(not(feature = "coordinator"))]
+    if config.coordinator.redis.is_some() {
+        warn!(
+            "coordinator: [coordinator.redis] is configured but the `coordinator` \
+             Cargo feature is disabled; ignoring"
+        );
+    }
     Arc::new(NoopCoordinator::new())
 }
 

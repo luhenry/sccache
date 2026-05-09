@@ -85,13 +85,86 @@ With the no-op backend every coordinator counter stays at zero -- which
 itself is a useful diagnostic: a configured backend that engages will
 show non-zero rows.
 
-## Backends
+## Enabling
 
-Backends slot in next to `noop` under `src/coordinator/` and select via
-a `[coordinator.<name>]` section in the sccache config (or matching
-`SCCACHE_COORDINATOR_<NAME>_*` environment variables). They are
-documented separately as they land.
+Build coordination is gated by the `coordinator` Cargo feature, which
+is enabled by default via the `all` feature set:
 
-For tests, `MockCoordinator` (in `src/coordinator/mock.rs`, `cfg(test)`
-only) lets a test script the sequence of `coordinate` decisions and
-`await_result` outcomes without standing up a backend.
+```sh
+cargo build --features coordinator
+```
+
+The default no-op coordinator is the fallback when no backend is
+configured, so enabling the feature alone has no runtime effect. A
+backend-specific section under `[coordinator]` in the sccache config
+selects an actual coordinator implementation.
+
+## Redis backend
+
+The first available backend is Redis. Add a `[coordinator.redis]`
+section to the sccache config:
+
+```toml
+[coordinator.redis]
+endpoint = "tcp://redis.example.internal:6379"
+username = "sccache"         # optional; AUTH username
+password = "s3cret"          # optional; AUTH password
+db = 0                       # logical database (default 0)
+lease_ttl_secs = 60          # backstop for crashed leaders
+heartbeat_interval_secs = 20 # leader refreshes the lease
+max_wait_secs = 600          # waiter ceiling -> redundant compile
+poll_interval_secs = 2       # pubsub fallback / TTL re-check
+```
+
+Only `endpoint` is required; the other fields default to the values
+shown. The lease store is small and ephemeral, so it can share the
+Redis instance (and logical database) used by the Redis cache backend.
+
+The Redis backend uses:
+
+* `SET NX EX` for atomic lease acquisition with TTL.
+* `EXPIRE` from a per-leader heartbeat task to keep the lease alive
+  for long compiles.
+* A Lua `GET / DEL` script for self-fenced lease release: a slow
+  Drop racing past the TTL cannot stomp a successor's lease.
+* `PUBLISH` on a per-key channel for sub-second waiter wakeup.
+* Polling on `poll_interval_secs` as a fallback for lost pubsub
+  notifications, plus a `TTL` check to detect crashed leaders before
+  the `max_wait_secs` deadline.
+
+If the Redis connection fails at startup, sccache logs a warning and
+falls back to the no-op coordinator -- builds keep working, just
+without cluster-wide deduplication.
+
+### Environment variables
+
+The same configuration can be set via environment variables, mirroring
+the `[cache.s3]` / `SCCACHE_BUCKET` convention:
+
+| Variable                                            | Field                      |
+|-----------------------------------------------------|----------------------------|
+| `SCCACHE_COORDINATOR_REDIS_ENDPOINT` (trigger)      | `endpoint`                 |
+| `SCCACHE_COORDINATOR_REDIS_USERNAME`                | `username`                 |
+| `SCCACHE_COORDINATOR_REDIS_PASSWORD`                | `password`                 |
+| `SCCACHE_COORDINATOR_REDIS_DB`                      | `db`                       |
+| `SCCACHE_COORDINATOR_REDIS_LEASE_TTL_SECS`          | `lease_ttl_secs`           |
+| `SCCACHE_COORDINATOR_REDIS_HEARTBEAT_INTERVAL_SECS` | `heartbeat_interval_secs`  |
+| `SCCACHE_COORDINATOR_REDIS_MAX_WAIT_SECS`           | `max_wait_secs`            |
+| `SCCACHE_COORDINATOR_REDIS_POLL_INTERVAL_SECS`      | `poll_interval_secs`       |
+
+`SCCACHE_COORDINATOR_REDIS_ENDPOINT` is the trigger: setting it alone
+enables the Redis coordinator with default tunables; the rest of the
+variables are honored only when the trigger is also set. When both
+the env vars and a file `[coordinator.redis]` section are present,
+the env vars override the file's `[coordinator.redis]` entirely.
+
+## Testing
+
+`MockCoordinator` (in `src/coordinator/mock.rs`, `cfg(test)` only)
+lets a test script the sequence of `coordinate` decisions and
+`await_result` outcomes for backend-agnostic unit tests.
+
+For end-to-end coverage of the Redis backend there is an integration
+test against a real Redis container in
+`tests/integration/scripts/test-coordinator-redis.sh`, exercised by
+`make test-coordinator-redis` and as part of `make test-backends`.
