@@ -304,7 +304,11 @@ mod client {
         }
         #[cfg(all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64"
+            )
         ))]
         impl crate::dist::pkg::ToolchainPackager for PanicToolchainPackager {
             fn write_pkg(self: Box<Self>, _f: super::fs::File) -> crate::errors::Result<()> {

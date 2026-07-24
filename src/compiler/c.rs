@@ -1333,7 +1333,11 @@ struct CToolchainPackager {
 #[cfg(feature = "dist-client")]
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
 ))]
 impl pkg::ToolchainPackager for CToolchainPackager {
     fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {

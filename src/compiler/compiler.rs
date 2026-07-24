@@ -64,6 +64,7 @@ use crate::errors::*;
     any(
         all(target_os = "linux", target_arch = "x86_64"),
         all(target_os = "linux", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "riscv64"),
         target_os = "freebsd"
     )
 ))]
@@ -73,6 +74,7 @@ pub const CAN_DIST_DYLIBS: bool = true;
     not(any(
         all(target_os = "linux", target_arch = "x86_64"),
         all(target_os = "linux", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "riscv64"),
         target_os = "freebsd"
     ))
 ))]

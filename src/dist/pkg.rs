@@ -22,7 +22,11 @@ use crate::errors::*;
 
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
 ))]
 pub use self::toolchain_imp::*;
 
@@ -41,7 +45,11 @@ pub trait OutputsRepackager {
 
 #[cfg(not(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
 )))]
 mod toolchain_imp {
     use super::ToolchainPackager;
@@ -60,7 +68,11 @@ mod toolchain_imp {
 
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
 ))]
 mod toolchain_imp {
     use super::SimplifyPath;
